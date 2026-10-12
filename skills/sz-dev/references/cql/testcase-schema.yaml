@@ -1,0 +1,32 @@
+# Declarative case schema example —— translated from the historical TC (SZ27614)
+# Full field semantics: references/automation.md, section 3.
+# The runner executes only on Linux test hosts (RHEL, recognizable by getsrcroot).
+
+case: SZ27614-premixed-IVD
+target: fbcht21                    # test host
+patient:                             # pick an existing test patient (the TC's `D <mrn>`
+  mrn: dst0513                        # is only a lister, it does not create a patient;
+                                      # `[user@host|dir] >` is a .dosu shell)
+  pid: 603980471
+  dbtds: [175, 2229]
+config:                            # site config preconditions (patched on setup, restored on teardown)
+  ccsys:
+    ccsys.UnlinkPatientStays: F
+  hl7local:
+    MED-store-units: ["ICU", "CCU"]
+setup:
+  - backup: rsync -av ./vol1/p603980471 /tmp/fixtures/     # mandatory for DB-writing cases
+  - ycql: file druglist-setup.ycql                          # ycql update sequence
+steps:
+  - send: cat fixtures/testPremixedIVD.scm | .dosu $BIN/cql -i$CCSYSDIR/cql/hl7/starthl7.dsspharm.scm
+asserts:
+  - ack: "ALL RESULTS PROCESSED"                            # parse the MSA segment from stdout;
+                                                             # also supports [{ctrl, msg}] item-by-item
+                                                             # matching (at sites like wrr the rejection
+                                                             # is also MSA AA — distinguish by text)
+  - cqldump:                                                # diff against the expected snapshot (timestamp mask)
+      cmd: cqldump 603980471 175 2229
+      expect_file: expect/premixed.dump
+teardown:
+  - restore: rsync -av /tmp/fixtures/p603980471 ./vol1/
+  - verify_clean: cqldump 603980471 175 2229 == empty       # restore verification; a failure must alarm

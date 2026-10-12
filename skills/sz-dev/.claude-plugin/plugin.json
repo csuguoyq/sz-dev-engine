@@ -1,0 +1,9 @@
+{
+  "name": "sz-dev",
+  "version": "2.2.0",
+  "description": "SoftZilla SZ end-to-end automation for any ccsrc module: module-pack capabilities, AI-implemented and AI-tested, one human checkpoint (gate 4), replay mode, two-stage MR.",
+  "author": {
+    "name": "PDG"
+  },
+  "defaultEnabled": true
+}

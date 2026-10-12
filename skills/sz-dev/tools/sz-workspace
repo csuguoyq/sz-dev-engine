@@ -1,0 +1,950 @@
+#!/bin/bash
+
+# sz-workspace — deterministic ccsrc workspace bootstrap for sz-dev.
+#
+# Fixed operation of Phase 0: resolve (and create when missing) the ccsrc
+# checkout an SZ is developed in, so every invocation can start from any
+# directory.
+#
+# Resolution order (first hit wins):
+#   1. the current directory already sits inside a ccsrc checkout;
+#   2. the registry entry ~/.sz-dev-workspaces/SZxxxx (a previous session's
+#      workspace, also honored when --name was used at creation time);
+#   3. the deterministic per-SZ workspace <root>/<user>_sz<n>/ccsrc —
+#      created and cloned (full history) when missing, reused when present.
+#
+# Output contract: human-readable progress on stderr; the last stdout line
+# of `ensure`/`check` is always `WORKSPACE=<absolute path>` on success,
+# preceded by `BRANCH=<baseline branch>` when the checkout has one and,
+# for `ensure`, by `MODE=<standard|replay>` — decided here at resolution
+# time (replay iff the SZ's fix commit is already in local git history),
+# persisted as <registry>/SZ<id>.mode, and consumed by sz-replay init and
+# the phase workflows instead of re-deriving it in Phase 1.
+#
+# Safety: never deletes anything, never clones over an existing path, and
+# refuses to touch a directory that is not a ccsrc checkout.
+
+set -euo pipefail
+
+DEFAULT_REPO_URL="https://vembgitlab.clinicomp.com:5443/ai/ccsrc.git"
+DEFAULT_ROOT="/project"
+# per-SZ project-name standard: {username}_sz{SZ}_ai (e.g. guoyq_sz30349_ai);
+# override via SZ_WORKSPACE_NAME_TEMPLATE ({user} and {sz} placeholders) or --name
+# The default goes through an intermediate var: a brace-containing
+# fallback inside ${...:-...} closes the expansion early and mangles
+# the template ({user} loses its closing brace to the expansion).
+# User config file: ${SZ_DEV_CONF:-~/.config/sz-dev/config}. KEY=value lines
+# (no quotes needed, inline comments not supported) providing per-user
+# defaults — typically SZ_CC_SRC_URL with a personal GitLab PAT so `ensure`
+# can clone without an interactive prompt:
+#   SZ_CC_SRC_URL=https://<user>:<token>@vembgitlab.clinicomp.com:5443/ai/ccsrc.git
+# The real environment wins over the config file. chmod 600 the file — it
+# holds a secret and must never be committed to the skill repository.
+load_user_conf() {
+    local conf="${SZ_DEV_CONF:-$HOME/.config/sz-dev/config}" line key val
+    [[ -f "$conf" ]] || return 0
+    while IFS= read -r line; do
+        [[ "$line" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] || continue
+        key="${line%%=*}" val="${line#*=}"
+        val="${val%\"}" val="${val#\"}" val="${val%\'}" val="${val#\'}"
+        case "$key" in
+            SZ_CC_SRC_URL|SZ_WORKSPACE_ROOT|SZ_WORKSPACE_NAME_TEMPLATE)
+                [[ -n "${!key:-}" ]] || export "$key=$val" ;;
+        esac
+    done < <(grep -vE '^[[:space:]]*(#|$)' "$conf")
+}
+load_user_conf
+
+# capture_clone_credentials: one-time interactive credential capture. Under
+# a TTY, prompt for the GitLab username + PAT, save SZ_CC_SRC_URL into the
+# user config (chmod 600), and refresh $url in the caller's scope — every
+# later run (and every other sz-dev tool) clones without prompting until
+# the token expires. Without a TTY (agent context) it returns 1 so the
+# caller prints the manual-setup block for the user.
+capture_clone_credentials() {
+    [[ -t 0 ]] || return 1
+    [[ -z "${CAPTURED_CREDENTIALS:-}" ]] || return 1
+    local conf="${SZ_DEV_CONF:-$HOME/.config/sz-dev/config}" user tok host
+    host="${url#*//}"; host="${host%%/*}"
+    log "interactive: GitLab credentials are needed to clone the ccsrc repository."
+    log "interactive: the PAT needs scopes read_repository + write_repository;"
+    log "interactive: it is saved to $conf (chmod 600) and reused until it expires."
+    read -r -p "GitLab username: " user || return 1
+    read -r -s -p "GitLab PAT (input hidden): " tok || return 1
+    echo >&2
+    [[ -n "$user" && -n "$tok" ]] || return 1
+    mkdir -p "$(dirname "$conf")"
+    grep -v '^SZ_CC_SRC_URL=' "$conf" 2>/dev/null > "$conf.tmp" || true
+    printf 'SZ_CC_SRC_URL=https://%s:%s@%s\n' "$user" "$tok" "$host" >> "$conf.tmp"
+    mv "$conf.tmp" "$conf"
+    chmod 600 "$conf"
+    url="https://$user:$tok@$host"
+    CAPTURED_CREDENTIALS=1
+    log "interactive: credentials saved to $conf — no further prompt until the token expires."
+}
+mask_url() { printf '%s' "$1" | sed -E 's#//[^/@]+@#//<user>:<token>@#'; }
+
+DEFAULT_NAME_TEMPLATE='{user}_sz{sz}_ai'
+NAME_TEMPLATE="${SZ_WORKSPACE_NAME_TEMPLATE:-$DEFAULT_NAME_TEMPLATE}"
+
+usage() {
+    cat <<EOF
+Usage:
+  $0 ensure <SZxxxx> [--name <project>] [--url <git-url>] [--branch <name>] [--root <dir>] [--inplace]
+  $0 check [dir]
+  $0 list [--stale]
+  $0 remove <SZxxxx>
+  $0 sync-skill  push this repo's skills/sz-dev to the installed copy and
+                 every registered workspace's seeded copy (verified)
+  $0 mr <SZxxxx> --title <t> --target <branch> [--approved]
+  $0 config   print the per-user clone-config setup (first-time setup)
+
+Commands:
+  ensure  Resolve the ccsrc workspace for SZxxxx and print MODE=<standard|replay>
+          + BRANCH=<baseline branch> + WORKSPACE=<path>. Creates and clones
+          <root>/<user>_sz<n>/ccsrc when missing. MODE is replay when the
+          SZ's fix commit already exists in local git history — the run then
+          proceeds replay-style (sz-replay init on the pre-fix baseline)
+          instead of implementing in the standard checkout.
+  check   Exit 0 and print WORKSPACE=<path> when <dir> (default cwd) is
+          inside a ccsrc checkout; exit 1 otherwise.
+  list    Print registered workspaces (--stale filters to dead entries).
+  remove  Unregister <SZxxxx>; the directory is left on disk.
+  mr      Two-stage MR: without --approved, print the proposal and exit 1
+          (a human approves source/target/title); with --approved, commit
+          the delivery files on sz/SZxxxx and push with GitLab
+          push-options to create the MR. Refuses before GATE 4 passed.
+
+Environment:
+  SZ_CC_SRC_URL       override the default clone URL
+  SZ_CC_SRC_MASTER    shared local master clone (default:
+                      <root>/<username>_ccsrc_ai/ccsrc): per-SZ workspaces
+                      clone from it locally (hardlinked, seconds); seeded
+                      once from an existing checkout or the network and
+                      refreshed on every ensure
+  SZ_WORKSPACE_ROOT   override the default root ($DEFAULT_ROOT)
+  SZ_WORKSPACE_DIR    directory `ensure` treats as "cwd" (defaults to \$PWD)
+  SZ_WORKSPACE_NAME_TEMPLATE  per-SZ project-name template, {user}/{sz}
+                      placeholders (default: {user}_sz{sz}_ai)
+  SZ_DEV_CONF         user config file with KEY=value defaults
+                      (default: ~/.config/sz-dev/config; environment wins;
+                      the usual place for a personal GitLab PAT — chmod 600;
+                      setup instructions: `$0 config`)
+  SZ_SKILL_INSTALL_DIR  sync-skill target for the installed copy
+                      (default: ~/.zcode/skills/sz-dev)
+
+Sharing: a ccsrc checkout hosting another SZ's .sz-dev/SZ* state tree
+must not silently host a second one — `git add -N` snapshots and the
+Phase 4 diff are not per-SZ. `ensure` refuses such a checkout unless
+--inplace is passed (the operator accepts the sharing); the acceptance
+is persisted (.sz-dev/.shared-inplace) and re-running `ensure` for an
+SZ already registered at the checkout is idempotent (no flag needed).
+EOF
+    exit 2
+}
+
+log() { printf '%s\n' "$*" >&2; }
+
+# repo remote URL of the checkout containing <dir> (first remote), empty if none
+repo_url() {
+    local dir="$1" top r url
+    top="$(git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || return 1
+    for r in $(git -C "$top" remote 2>/dev/null); do
+        url="$(git -C "$top" remote get-url "$r" 2>/dev/null)" || continue
+        printf '%s\n' "$url"
+        return 0
+    done
+    return 1
+}
+
+# is the checkout containing <dir> a ccsrc clone? (remote basename == ccsrc,
+# so https / ssh / local-mirror remotes all match)
+is_ccsrc_checkout() {
+    local url base
+    url="$(repo_url "$1" 2>/dev/null)" || return 1
+    base="${url%% }"
+    base="${base%.git}"
+    base="${base##*/}"
+    [[ "$base" == "ccsrc" ]]
+}
+
+registry_dir() { printf '%s\n' "${SZ_WORKSPACE_REGISTRY:-$HOME/.sz-dev-workspaces}"; }
+
+# ensure_branch <top> <id> — the per-SZ working branch (sz/SZxxxx) is the
+# MR source; an existing branch is switched to (never reset — a mid-run
+# workspace must keep its commits), a fresh one branches from HEAD
+ensure_branch() {
+    local top="$1" id="$2" wb="sz/SZ$id"
+    if git -C "$top" show-ref --verify --quiet "refs/heads/$wb"; then
+        git -C "$top" checkout -q "$wb"
+        log "workspace branch: $wb (existing)"
+    else
+        git -C "$top" checkout -q -b "$wb"
+        log "workspace branch: $wb (created from $(git -C "$top" rev-parse --short HEAD))"
+    fi
+}
+
+# success output: BRANCH (when the checkout has a current branch) precedes
+# the mandatory final WORKSPACE line
+# Mode is decided HERE, at workspace resolution — not later in Phase 1:
+# replay mode iff the SZ's fix commit is already in local git history;
+# the commit hint prefers the workspace's own branch history (replay-mode
+# disambiguation signal 2: the branch domain wins over hotfix backports
+# of the same change), falling back to --all only for the mode verdict.
+# Persisted as <registry>/SZ<id>.mode and emitted as MODE=<standard|replay>;
+# sz-replay init and the phase workflows read this verdict instead of
+# re-deriving.
+emit() {
+    local id="$1" top="$2" br mode="standard" hit
+    if [[ -n "$id" ]]; then
+        # The fix-commit message carries the SZ id in its SUBJECT (check-in
+        # convention: "Checked in ... SZ22052. [DSS]..."). A body-only mention
+        # (e.g. an unrelated commit referencing the SZ in its notes) must not
+        # qualify, or replay baselines get anchored on a post-fix tree.
+        subject_hit() {
+            local c subj
+            while read -r c; do
+                [ -n "$c" ] || continue
+                subj="$(git -C "$top" log -1 --pretty=%s "$c" 2>/dev/null || true)"
+                if [[ "$subj" =~ SZ${id}([^0-9]|$) ]]; then
+                    printf '%s\n' "$c"
+                    return 0
+                fi
+            done
+            return 1
+        }
+        hit="$(git -C "$top" log \
+                --extended-regexp --grep="SZ${id}([^0-9]|$)" \
+                -20 --pretty=%H 2>/dev/null | subject_hit || true)"
+        if [[ -z "$hit" ]]; then
+            hit="$(git -C "$top" log --all \
+                    --extended-regexp --grep="SZ${id}([^0-9]|$)" \
+                    -20 --pretty=%H 2>/dev/null | subject_hit || true)"
+        fi
+        [[ -n "$hit" ]] && mode="replay"
+        mkdir -p "$(registry_dir)"
+        printf '%s\n' "$mode" > "$(registry_dir)/SZ${id}.mode"
+        printf 'MODE=%s\n' "$mode"
+    fi
+    br="$(git -C "$top" branch --show-current 2>/dev/null)"
+    [[ -n "$br" ]] && printf 'BRANCH=%s\n' "$br"
+    printf 'WORKSPACE=%s\n' "$top"
+}
+
+register() {
+    local id="$1" path="$2"
+    mkdir -p "$(registry_dir)"
+    printf '%s\n' "$path" > "$(registry_dir)/SZ${id}"
+}
+
+cmd_check() {
+    local dir="${1:-${SZ_WORKSPACE_DIR:-$PWD}}"
+    if is_ccsrc_checkout "$dir"; then
+        local top
+        top="$(git -C "$dir" rev-parse --show-toplevel)"
+        log "ok: $dir is inside ccsrc checkout $top"
+        # check has no SZ id: emit without the MODE line
+        emit "" "$top"
+        return 0
+    fi
+    log "no: $dir is not inside a ccsrc checkout"
+    return 1
+}
+
+cmd_ensure() {
+    local sz_arg="" name="" url="${SZ_CC_SRC_URL:-$DEFAULT_REPO_URL}" \
+          branch="" root="${SZ_WORKSPACE_ROOT:-$DEFAULT_ROOT}" inplace=""
+
+    [[ $# -ge 1 ]] || usage
+    sz_arg="$1"; shift
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --name)    [[ $# -ge 2 ]] || usage; name="$2"; shift 2 ;;
+            --url)     [[ $# -ge 2 ]] || usage; url="$2"; shift 2 ;;
+            --branch)  [[ $# -ge 2 ]] || usage; branch="$2"; shift 2 ;;
+            --root)    [[ $# -ge 2 ]] || usage; root="$2"; shift 2 ;;
+            --inplace) inplace=1; shift ;;
+            *) usage ;;
+        esac
+    done
+
+    local arg="${sz_arg^^}" id
+    id="${arg#SZ}"
+    [[ "$id" =~ ^[0-9]+$ ]] || { log "ERROR: invalid SZ: $sz_arg"; exit 2; }
+
+    local cwd="${SZ_WORKSPACE_DIR:-$PWD}"
+    local reg_file="$(registry_dir)/SZ${id}"
+
+    # refuse a checkout that already hosts another SZ's state tree —
+    # snapshot patches and the Phase 4 diff are checkout-wide, not per-SZ.
+    # Sharing is idempotent once accepted: the guard short-circuits when
+    # this SZ is already registered at the checkout, or when a previous
+    # --inplace acceptance is persisted in .sz-dev/.shared-inplace.
+    shared_checkout_guard() {
+        local top="$1" other
+        if [[ -f "$reg_file" && "$(cat "$reg_file")" == "$top" ]] \
+           || [[ -f "$top/.sz-dev/.shared-inplace" ]]; then
+            return 0
+        fi
+        for other in "$top"/.sz-dev/SZ*; do
+            [[ -e "$other" ]] || return 0
+            if [[ "$(basename "$other")" != "SZ${id}" ]]; then
+                if [[ -n "$inplace" ]]; then
+                    mkdir -p "$top/.sz-dev"
+                    printf 'shared checkout accepted by ensure SZ%s --inplace %s\n' \
+                        "$id" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+                        > "$top/.sz-dev/.shared-inplace"
+                    log "WARNING: sharing checkout $top with $(basename "$other") (--inplace accepted, persisted)"
+                    return 0
+                fi
+                log "ERROR: $top already hosts $(basename "$other")'s state tree; a second SZ in the"
+                log "        same checkout would mix snapshots and delivery diffs. Run in that SZ's"
+                log "        workspace, move it away, or pass --inplace to accept the sharing."
+                exit 3
+            fi
+        done
+    }
+
+    # keep runtime state (.sz-dev/) alive across git clean -xfd: it is
+    # gitignored, so .git/info/exclude is not enough by itself — but a
+    # local exclude entry documents the risk and covers trackless cleanups
+    pin_state_dir() {
+        local top="$1" excl="$1/.git/info/exclude"
+        [[ -d "$1/.git" ]] || return 0
+        if [[ -f "$excl" ]] && grep -qxF ".sz-dev/" "$excl"; then
+            return 0
+        fi
+        printf '.sz-dev/\n' >> "$excl"
+        log "state tree pinned in $excl (survives git clean -xfd)"
+    }
+
+    # the standard path for THIS SZ — every reuse (cwd checkout, registry)
+    # must match it exactly, otherwise fall through and create it
+    local user expected_proj expected_ws
+    user="$(id -un | tr 'A-Z' 'a-z')"
+    if [[ -n "$name" ]]; then
+        expected_proj="$name"
+    else
+        # sed, not ${var/pat}: brace-escaping inside parameter-expansion
+        # glob patterns is unreliable across bash versions
+        expected_proj="$(printf '%s' "$NAME_TEMPLATE" | sed -e "s/{user}/$user/" -e "s/{sz}/$id/")"
+    fi
+    expected_ws="${root%/}/${expected_proj}/ccsrc"
+
+    # replay SZs relocate to the _aireplay project dir (single workspace);
+    # reuse paths below must accept it as this SZ's own workspace
+    local replay_ws=""
+    if [[ "$expected_proj" == *_ai ]]; then
+        replay_ws="${root%/}/${expected_proj%_ai}_aireplay/ccsrc"
+    fi
+
+    # 1. cwd already a ccsrc checkout -> use it ONLY when it is the
+    #    standard path for this SZ; a non-matching checkout (e.g. a
+    #    developer checkout) is never reused — snapshots and delivery
+    #    diffs belong in the per-SZ standard workspace
+    if is_ccsrc_checkout "$cwd"; then
+        local top
+        top="$(git -C "$cwd" rev-parse --show-toplevel)"
+        if [[ "$top" == "$expected_ws" || "$top" == "$replay_ws" ]]; then
+            shared_checkout_guard "$top"
+            log "workspace: using current checkout $top"
+            if [[ -f "$reg_file" && "$(cat "$reg_file")" != "$top" ]]; then
+                log "notice: registry pointed at $(cat "$reg_file"); updated to $top"
+            fi
+            pin_state_dir "$top"
+            register "$id" "$top"
+            git -C "$top" symbolic-ref -q HEAD >/dev/null && ensure_branch "$top" "$id"
+            emit "$id" "$top"
+            return 0
+        fi
+        log "notice: current checkout $top does not match the standard workspace"
+        log "        path ($expected_ws) — not reusing it; creating the standard workspace"
+    fi
+
+    # 2. registry hit -> reuse that workspace ONLY when it is the
+    #    standard path for this SZ
+    if [[ -f "$reg_file" ]]; then
+        local reg_path
+        reg_path="$(cat "$reg_file")"
+        if [[ -d "$reg_path" ]] && is_ccsrc_checkout "$reg_path"; then
+            if [[ "$reg_path" != "$expected_ws" && "$reg_path" != "$replay_ws" ]]; then
+                log "notice: registry entry ($reg_path) does not match the standard"
+                log "        workspace path ($expected_ws) — ignoring it"
+            else
+                shared_checkout_guard "$reg_path"
+                log "workspace: registry hit, reusing $reg_path"
+                pin_state_dir "$reg_path"
+                git -C "$reg_path" symbolic-ref -q HEAD >/dev/null && ensure_branch "$reg_path" "$id"
+                emit "$id" "$reg_path"
+                return 0
+            fi
+        else
+            log "notice: registry entry stale ($reg_path), ignoring"
+        fi
+    fi
+
+    # 3. deterministic per-SZ workspace (the standard path)
+    local ws="$expected_ws"
+
+    if [[ -e "$ws" ]]; then
+        if is_ccsrc_checkout "$ws"; then
+            shared_checkout_guard "$ws"
+            log "workspace: reusing existing $ws"
+            pin_state_dir "$ws"
+            register "$id" "$ws"
+            git -C "$ws" symbolic-ref -q HEAD >/dev/null && ensure_branch "$ws" "$id"
+            emit "$id" "$ws"
+            return 0
+        fi
+        log "ERROR: $ws exists but is not a ccsrc checkout — refusing to touch it."
+        log "        Move it away or pass --name <project> for a different project name."
+        exit 3
+    fi
+
+    seed_attach_default_branch() {
+        # $1 = master clone; land its HEAD on origin's default branch —
+        # seed sources may be detached (e.g. a replay workspace at fix^)
+        local m="$1" def
+        def="$(git -C "$m" symbolic-ref refs/remotes/origin/HEAD 2>/dev/null | sed 's|^refs/remotes/origin/||' || true)"
+        if [[ -z "$def" ]]; then
+            # sane preference order: the project's main branch first
+            def="$(git -C "$m" for-each-ref --format='%(refname:short)' refs/remotes/origin 2>/dev/null \
+                | sed 's|^origin/||' | grep -xE 'ee-branch-ai|master|main' | head -1 || true)"
+        fi
+        if [[ -z "$def" ]]; then
+            def="$(git -C "$m" for-each-ref --format='%(refname:short)' refs/remotes/origin 2>/dev/null | sed 's|^origin/||' | head -1 || true)"
+        fi
+        [[ -n "$def" ]] && git -C "$m" checkout -q -f -B "$def" "origin/$def" 2>/dev/null || true
+    }
+    log "workspace: creating $expected_ws and cloning (full history) ..."
+    # one-time credential bootstrap: a PAT already stored in
+    # ~/.git-credentials is invisible to fresh clones until
+    # credential.helper is configured globally — adopt it automatically
+    # instead of failing on an askpass prompt
+    if [[ -z "$(git config --global --get credential.helper 2>/dev/null)" ]] \
+       && [[ -f "$HOME/.git-credentials" ]]; then
+        git config --global credential.helper store
+        log "notice: credential.helper=store set globally (one-time bootstrap from existing ~/.git-credentials)"
+    fi
+    if [[ -z "${SZ_CC_SRC_URL:-}" && ! -f "${SZ_DEV_CONF:-$HOME/.config/sz-dev/config}" ]]; then
+        log "notice: no per-user clone config found — if cloning fails on credentials, set it up:"
+        log "        $0 config"
+    fi
+    # per-SZ workspaces clone from a shared LOCAL master mirror: one full
+    # network clone ever; per-SZ clones are local + hardlinked = seconds,
+    # and fix^ baselines check out straight from local history
+    # named {username}_ccsrc_ai by operator decision (2026-09-28): a plain
+    # full-history checkout under the same root as the SZ workspaces
+    local master="${SZ_CC_SRC_MASTER:-${root%/}/$(id -un | tr 'A-Z' 'a-z')_ccsrc_ai/ccsrc}"
+    if [[ -d "$master/.git" ]]; then
+        log "workspace: refreshing local master $master ..."
+        GIT_TERMINAL_PROMPT=0 git -C "$master" fetch --quiet origin --prune >/dev/null 2>&1 || true
+    fi
+    if [[ ! -d "$master/.git" ]]; then
+        # seed from an existing local ccsrc checkout when one is
+        # registered (instant), else from the network (one-time full clone)
+        local seed_src=""
+        local f cand
+        for f in "$(registry_dir)"/SZ*; do
+            [[ -f "$f" ]] || continue
+            case "$(basename "$f")" in *.mode) continue ;; esac
+            cand="$(cat "$f")"
+            if [[ -d "$cand/.git" ]]; then seed_src="$cand"; break; fi
+        done
+        mkdir -p "$(dirname "$master")"
+        local seeded=0
+        mkdir -p "$master"
+        if [[ -n "$seed_src" ]]; then
+            log "workspace: seeding local master from $seed_src ..."
+            if git clone --quiet "$seed_src" "$master" 1>&2; then
+                git -C "$master" remote set-url origin "$url"
+                git -C "$master" fetch --quiet origin --prune >/dev/null 2>&1 || true
+                seed_attach_default_branch "$master"
+                seeded=1
+            else
+                rm -rf "$master"
+            fi
+        fi
+        if [[ $seeded -eq 0 ]]; then
+            log "workspace: seeding local master from the network (one-time) ..."
+            if GIT_TERMINAL_PROMPT=0 git clone --quiet "$url" "$master" 1>&2; then
+                seed_attach_default_branch "$master"
+                seeded=1
+            elif capture_clone_credentials \
+                 && GIT_TERMINAL_PROMPT=0 git clone --quiet "$url" "$master" 1>&2; then
+                seed_attach_default_branch "$master"
+                seeded=1
+            else
+                log "notice: master seed failed — falling back to a direct URL clone"
+                rm -rf "$master"
+            fi
+        fi
+        [[ $seeded -eq 1 ]] && log "workspace: local master ready at $master"
+    fi
+
+    mkdir -p "$(dirname "$expected_ws")"
+    if [[ -d "$master/.git" ]]; then
+        local clone_args=("$master" "$ws")
+        [[ -z "$branch" ]] || clone_args=(--branch "$branch" "${clone_args[@]}")
+        if GIT_TERMINAL_PROMPT=0 git clone --quiet "${clone_args[@]}" 1>&2; then
+            git -C "$ws" remote set-url origin "$url"
+            git -C "$ws" config remote.origin.fetch '+refs/heads/*:refs/remotes/origin/*'
+            git -C "$ws" fetch --quiet origin '+refs/heads/*:refs/remotes/origin/*' --prune 2>/dev/null || true
+        else
+            log "notice: local clone from master failed — falling back to a direct URL clone"
+            rm -rf "$ws"
+        fi
+    fi
+    if [[ ! -d "$ws/.git" ]]; then
+        local clone_args=("$url" "$ws")
+        [[ -z "$branch" ]] || clone_args=(--branch "$branch" "${clone_args[@]}")
+        if ! GIT_TERMINAL_PROMPT=0 git clone "${clone_args[@]}" 1>&2; then
+            # auth failure: under a TTY offer the one-time interactive
+            # capture (saved to the user config = valid until token expiry),
+            # then retry once with the fresh URL
+            if capture_clone_credentials; then
+                rm -rf "$ws"
+                clone_args=("$url" "$ws")
+                [[ -z "$branch" ]] || clone_args=(--branch "$branch" "${clone_args[@]}")
+                GIT_TERMINAL_PROMPT=0 git clone "${clone_args[@]}" 1>&2 || true
+            fi
+            if [[ ! -d "$ws/.git" ]]; then
+                log "ERROR: git clone failed (url: $(mask_url "$url"))."
+                log "        One-time credentials setup (pick one; valid until the token expires):"
+                log "          a) run in YOUR OWN terminal, from an interactive shell:"
+                log "             bash $0 ensure SZ$id"
+                log "             (it will prompt for username + PAT and save them)"
+                log "          b) put your GitLab PAT in ~/.git-credentials as"
+                log "             https://<user>:<token>@vembgitlab.clinicomp.com:5443"
+                log "             then chmod 600 ~/.git-credentials (re-run ensure)"
+                log "          c) $0 config  (SZ_CC_SRC_URL with embedded PAT in"
+                log "             ${SZ_DEV_CONF:-$HOME/.config/sz-dev/config})"
+                exit 3
+            fi
+        fi
+    fi
+    # replay mode (fix commit already in history): the replay project dir
+    # IS the SZ's single workspace — move the fresh clone there and land
+    # it detached on the pre-fix baseline (fix^). One directory per SZ:
+    # code, history, and run state all live in it; no second checkout.
+    # The anchor must be the SZ's FIRST landed content change, not merely
+    # the newest commit that mentions the SZ: harness commits (ai-flow/,
+    # skills/) reference SZ ids in their bodies ("updates from the
+    # SZ22052 replay sessions") and would anchor the baseline on a
+    # post-fix tree. Subject-only mention (check-in convention) plus at
+    # least one file outside the harness trees, oldest first — mirrors
+    # ai-flow's findFixCommit.
+    anchor_hit() {
+        local c subj
+        while read -r c; do
+            [ -n "$c" ] || continue
+            subj="$(git -C "$ws" log -1 --pretty=%s "$c" 2>/dev/null || true)"
+            [[ "$subj" =~ SZ${id}([^0-9]|$) ]] || continue
+            if git -C "$ws" show --name-only --pretty=format: "$c" 2>/dev/null \
+               | grep -qv -e '^ai-flow/' -e '^skills/' -e '^$'; then
+                printf '%s\n' "$c"
+                return 0
+            fi
+        done
+        return 1
+    }
+    local fix
+    fix="$(git -C "$ws" log --all --reverse \
+            --extended-regexp --grep="SZ${id}([^0-9]|$)" \
+            --pretty=%H 2>/dev/null | anchor_hit || true)"
+    if [[ -n "$fix" ]]; then
+        local replay_proj="${expected_proj%_ai}"
+        if [[ "$replay_proj" != "$expected_proj" ]]; then
+            local replay_ws="${root%/}/${replay_proj}_aireplay/ccsrc"
+            if [[ "$replay_ws" != "$ws" && ! -e "$replay_ws" ]]; then
+                mkdir -p "$(dirname "$replay_ws")"
+                mv "$ws" "$replay_ws"
+                rmdir "$(dirname "$ws")" 2>/dev/null || true
+                log "workspace: replay SZ — single workspace relocated to $replay_ws"
+            fi
+            [[ -d "$replay_ws/.git" ]] && ws="$replay_ws"
+        fi
+        git -C "$ws" checkout -q --detach "${fix}^"
+        log "workspace: checked out pre-fix baseline $(git -C "$ws" rev-parse --short "${fix}^") (${fix}^)"
+        log "REMIND: ensure did NOT create the replay registry entry — next action: bash \"\$(dirname \"\$0\")/sz-replay\" init $id $fix"
+    fi
+    register "$id" "$ws"
+    log "workspace: ready"
+    [[ -n "$fix" ]] || ensure_branch "$ws" "$id"
+    emit "$id" "$ws"
+}
+
+cmd_list() {
+    local reg f id path state want="${1:-}"
+    reg="$(registry_dir)"
+    printf '%-10s %-8s %s\n' SZ state path
+    for f in "$reg"/SZ*; do
+        [[ -f "$f" ]] || continue
+        case "$f" in *.mode) continue ;; esac
+        id="$(basename "$f")"
+        path="$(cat "$f")"
+        if [[ -d "$path" ]] && is_ccsrc_checkout "$path"; then
+            state=ok
+        else
+            state=stale
+        fi
+        [[ -z "$want" || "$want" == "--stale" && "$state" == "stale" ]] || continue
+        printf '%-10s %-8s %s\n' "$id" "$state" "$path"
+    done
+}
+
+# remove <SZxxxx>: unregister the workspace (the directory is left on disk
+# for manual deletion — this tool never deletes content)
+cmd_remove() {
+    [[ $# -eq 1 ]] || usage
+    local sz_arg="$1" arg id reg_file
+    arg="${sz_arg^^}"
+    id="${arg#SZ}"
+    [[ "$id" =~ ^[0-9]+$ ]] || { log "ERROR: invalid SZ: $sz_arg"; exit 2; }
+    reg_file="$(registry_dir)/SZ${id}"
+    if [[ -f "$reg_file" ]]; then
+        log "unregistered $(cat "$reg_file") (directory left on disk)"
+        rm "$reg_file"
+    else
+        log "no registry entry for SZ${id}"
+    fi
+}
+
+# cmd_mr <SZxxxx> --title T --target B [--approved]
+# Two-stage by design: WITHOUT --approved it prints the MR proposal and
+# refuses (a human must approve the source/target/title first); WITH
+# --approved it commits the delivery files on the SZ working branch and
+# pushes with GitLab push-options to create the MR.
+cmd_mr() {
+    [[ $# -ge 1 ]] || usage
+    local sz_arg="$1"; shift
+    local arg="${sz_arg^^}" id title="" target="" approved=0
+    id="${arg#SZ}"
+    [[ "$id" =~ ^[0-9]+$ ]] || { log "ERROR: invalid SZ: $sz_arg"; exit 2; }
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --title)   [[ $# -ge 2 ]] || usage; title="$2"; shift 2 ;;
+            --target)  [[ $# -ge 2 ]] || usage; target="$2"; shift 2 ;;
+            --approved) approved=1; shift ;;
+            *) usage ;;
+        esac
+    done
+    local reg_file="$(registry_dir)/SZ${id}" top
+    [[ -f "$reg_file" ]] || { log "ERROR: no workspace registered for SZ${id}"; exit 1; }
+    top="$(cat "$reg_file")"
+    [[ -d "$top" ]] || { log "ERROR: registered workspace missing: $top"; exit 1; }
+
+    # push/MR happens ONLY on the standard per-SZ workspace — any
+    # non-standard path (the developer checkout among them) is refused,
+    # so the developer checkout can never be pushed from this tool
+    local user_u expected_proj mr_ws
+    user_u="$(id -un | tr 'A-Z' 'a-z')"
+    expected_proj="$(printf '%s' "$NAME_TEMPLATE" | sed -e "s/{user}/$user_u/" -e "s/{sz}/$id/")"
+    mr_ws="${SZ_WORKSPACE_ROOT%/}/${expected_proj}/ccsrc"
+    [[ "$top" == "$mr_ws" ]] || {
+        log "ERROR: refusing to push from '$top' — MR/push is only allowed on the"
+        log "        standard per-SZ workspace ($mr_ws). The developer checkout never pushes."
+        exit 1
+    }
+
+    # gate check: the run must be complete before an MR is even proposed
+    local prog="$top/.sz-dev/SZ${id}/progress.md"
+    if [[ ! -f "$prog" ]] || ! grep -q "^gate4: passed" "$prog" || grep -qE "^awaiting: .+$" "$prog"; then
+        log "ERROR: SZ${id} has not passed GATE 4 (or an escalation is open) —"
+        log "        complete Phase 4 and get the human audit before proposing an MR."
+        exit 1
+    fi
+
+    local wb="sz/SZ${id}" cur
+    cur="$(git -C "$top" branch --show-current)"
+    [[ "$cur" == "$wb" ]] || { log "ERROR: workspace is on branch '$cur', expected '$wb' (re-run ensure)"; exit 1; }
+
+    if [[ $approved -ne 1 ]]; then
+        # The human approves a commit of everything listed here, so the
+        # proposal shows the actual file list (a count alone once let
+        # stray files ride the delivery unnoticed); anything outside
+        # changed-paths.txt is flagged — pack write-backs are expected
+        # to appear there, true strays are not.
+        local proposal_files plan_file flagged="" total=0 out_of_plan=0
+        proposal_files="$(cd "$top" && git status --porcelain \
+            | sed -n 's/^.. //p' | sed 's/.* -> //' \
+            | grep -v -e '^\.sz-dev/' -e '/\.sz-dev/' | sort)"
+        plan_file="$top/.sz-dev/SZ${id}/changed-paths.txt"
+        if [[ -n "$proposal_files" ]]; then
+            while IFS= read -r f; do
+                total=$((total + 1))
+                if [[ -n "$plan_file" && -f "$plan_file" ]] \
+                   && ! grep -qxF "$f" "$plan_file"; then
+                    flagged+="  ! $f  [not in changed-paths.txt]"$'\n'
+                    out_of_plan=$((out_of_plan + 1))
+                else
+                    flagged+="    $f"$'\n'
+                fi
+            done <<< "$proposal_files"
+        fi
+        cat <<EOF
+MR PROPOSAL for SZ${id} (nothing executed — a human must approve):
+  source:  $wb
+  target:  ${target:-<required: --target>}
+  title:   ${title:-<required: --title>}
+  files:   ${total} changed file(s) outside .sz-dev/ (${out_of_plan} not in changed-paths.txt)
+${flagged}
+Re-run with --approved (and --title/--target) to commit and create the MR.
+EOF
+        exit 1
+    fi
+
+    [[ -n "$title" && -n "$target" ]] || { log "ERROR: --approved needs --title and --target"; exit 2; }
+    # .sz-dev is ignored (.git/info/exclude via pin_state_dir + .gitignore),
+    # so plain -A never stages run state — an explicit exclude pathspec here
+    # would only trip git's ignored-paths warning
+    git -C "$top" add -A
+    if git -C "$top" diff --cached --quiet; then
+        log "nothing to commit on $wb (already committed?)"
+    else
+        git -C "$top" commit -q -m "$title"
+        log "committed: $title"
+    fi
+    log "pushing $wb -> origin (creating MR -> $target) ..."
+    # the ONLY push this tool ever performs: on the per-SZ standard
+    # workspace's sz/SZxxxx branch, and only with --approved above
+    if git -C "$top" push -u origin "$wb" -o merge_request.create -o merge_request.title="$title" -o merge_request.target="$target" 2>&1; then
+        log "MR created (see push output for the URL)"
+    else
+        log "push with MR push-options failed — the remote may not support them;"
+        log "retrying a plain push (create the MR manually: $wb -> $target)"
+        git -C "$top" push -u origin "$wb"
+        log "branch pushed; open the MR on the remote web UI"
+    fi
+}
+
+# cmd_snapshot <SZxxxx> [--label <name>]
+# The step checkpoint primitive, mechanized so the git recipe cannot
+# drift: intent-to-add exactly the plan's paths (changed-paths.txt —
+# never a repo-wide `git add -N .`, which would sweep other SZs' and
+# pre-existing untracked files into the patch), then write the
+# cumulative binary diff as checkpoints/<label>.patch. Works in the
+# standard workspace and the replay tree alike (both keep .git; the
+# injected dirs are skip-worktree, so they never enter the patch).
+# Cumulative semantics: the patch is the whole working tree vs HEAD, so
+# "before step m" already contains steps 1..m-1. Rollback of step m =
+# reset the paths that step touched, forward-apply this patch limited to
+# those paths, delete files the step created.
+cmd_snapshot() {
+    [[ $# -ge 1 ]] || usage
+    local sz_arg="$1"; shift
+    local arg="${sz_arg^^}" id label=""
+    id="${arg#SZ}"
+    [[ "$id" =~ ^[0-9]+$ ]] || { log "ERROR: invalid SZ: $sz_arg"; exit 2; }
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --label) [[ $# -ge 2 ]] || usage; label="$2"; shift 2 ;;
+            *) usage ;;
+        esac
+    done
+    local reg_file="$(registry_dir)/SZ${id}" top
+    [[ -f "$reg_file" ]] || { log "ERROR: no workspace registered for SZ${id}"; exit 1; }
+    top="$(cat "$reg_file")"
+    [[ -d "$top/.git" ]] || { log "ERROR: registered workspace is not a git checkout: $top"; exit 1; }
+    local state="$top/.sz-dev/SZ${id}"
+    local plan="$state/changed-paths.txt"
+    [[ -f "$plan" ]] || { log "ERROR: no changed-paths.txt at $plan — Phase 2 Step 1 writes it first"; exit 1; }
+    mkdir -p "$state/checkpoints"
+    # intent-to-add each planned path; a path the step will create later
+    # does not exist yet — record and skip it (the next snapshot picks it up)
+    local p skipped=""
+    while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        if [[ -e "$top/$p" ]]; then
+            git -C "$top" add -N -- "$p" 2>/dev/null || true
+        else
+            skipped+="$p"$'\n'
+        fi
+    done < "$plan"
+    [[ -n "$skipped" ]] && log "note: not on disk yet (intent-to-add skipped, next snapshot picks them up): $(printf '%s' "$skipped" | tr '\n' ' ')"
+    if [[ -z "$label" ]]; then
+        local n
+        # find, not `ls ...glob | wc -l`: an unmatched glob makes ls exit
+        # 2 and pipefail+set -e kill the function on the first snapshot
+        n="$(find "$state/checkpoints" -name 'step-*-pre.patch' 2>/dev/null | wc -l)"
+        label="$(printf 'step-%02d-pre' "$((n + 1))")"
+    fi
+    local out="$state/checkpoints/${label}.patch"
+    git -C "$top" diff --binary > "$out"
+    log "snapshot: $out ($(grep -c '^diff --git' "$out" 2>/dev/null || echo 0) file(s) in patch; cumulative vs HEAD)"
+    log "rollback step m: git -C $top checkout -- <step-m paths>; git -C $top apply --include=<path> $out; rm files the step created"
+}
+
+# cmd_package <SZxxxx> [--out <dir>]
+# Delivery tarball for a STANDARD run (sz-replay package is the replay
+# equivalent): the recorded path set (changed-paths.txt) ∩ working-tree
+# diff, never "all working-tree changes" and never anything under
+# .sz-dev/. Named per the global policy — SZ number + current Beijing
+# time to the minute — written to ~/sz/ (or --out), listing verified.
+cmd_package() {
+    [[ $# -ge 1 ]] || usage
+    local sz_arg="$1"; shift
+    local arg="${sz_arg^^}" id out="$HOME/sz"
+    id="${arg#SZ}"
+    [[ "$id" =~ ^[0-9]+$ ]] || { log "ERROR: invalid SZ: $sz_arg"; exit 2; }
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --out) [[ $# -ge 2 ]] || usage; out="$2"; shift 2 ;;
+            *) usage ;;
+        esac
+    done
+    local reg_file="$(registry_dir)/SZ${id}" top
+    [[ -f "$reg_file" ]] || { log "ERROR: no workspace registered for SZ${id}"; exit 1; }
+    top="$(cat "$reg_file")"
+    [[ -d "$top/.git" ]] || { log "ERROR: registered workspace is not a git checkout: $top"; exit 1; }
+    local state="$top/.sz-dev/SZ${id}"
+    local plan="$state/changed-paths.txt"
+    [[ -f "$plan" ]] || { log "ERROR: no changed-paths.txt at $plan"; exit 1; }
+    local paths p
+    paths=""
+    while IFS= read -r p; do
+        [[ -n "$p" ]] || continue
+        # authoritatively: plan ∩ working-tree diff (raw diff alone would
+        # sweep other SZs' changes on a shared checkout)
+        if git -C "$top" diff --name-only -- "$p" 2>/dev/null | grep -q . ; then
+            paths+="$p "
+        else
+            log "note: planned path unchanged in working tree, excluded from package: $p"
+        fi
+    done < "$plan"
+    [[ -n "${paths// /}" ]] || { log "ERROR: no changed paths to package (plan ∩ diff is empty)"; exit 1; }
+    mkdir -p "$out"
+    local ts pkg
+    ts="$(TZ=Asia/Shanghai date +%Y%m%d%H%M)"
+    pkg="$out/SZ${id}_${ts}.tar.gz"
+    # shellcheck disable=SC2086 — the path list is the tar argument list
+    tar czf "$pkg" -C "$top" $paths
+    log "delivery package: $pkg"
+    log "contents (verify — no .sz-dev/ or attachment/ path may appear):"
+    tar tzf "$pkg" | sed 's/^/  /'
+    if tar tzf "$pkg" | grep -qE '(^|/)\.sz-dev(/|$)|/attachment/'; then
+        log "ERROR: run state leaked into the package — delete it and fix the path list"
+        exit 1
+    fi
+    printf 'PACKAGE=%s\n' "$pkg"
+}
+
+cmd_config() {
+    cat <<'EOF'
+sz-workspace per-user clone config (first-time setup)
+=====================================================
+The ccsrc clone URL with your personal GitLab PAT lives OUTSIDE this
+repository, in:  ~/.config/sz-dev/config   (path overridable via SZ_DEV_CONF)
+
+Setup:
+  1. In GitLab (vembgitlab.clinicomp.com:5443): avatar -> Edit profile ->
+     Access Tokens -> create a token with scopes read_repository +
+     write_repository (nothing else). The token is shown once — copy it.
+  2. mkdir -p ~/.config/sz-dev && chmod 700 ~/.config/sz-dev
+  3. Create ~/.config/sz-dev/config with this one line
+     (<user> = your GitLab username, <token> = the glpat-... value):
+         SZ_CC_SRC_URL=https://<user>:<token>@vembgitlab.clinicomp.com:5443/ai/ccsrc.git
+  4. chmod 600 ~/.config/sz-dev/config   (it holds a secret — never commit it)
+  5. Verify: git ls-remote https://vembgitlab.clinicomp.com:5443/ai/ccsrc.git HEAD
+
+File format: KEY=value lines, no quotes needed. Optional keys:
+  SZ_WORKSPACE_ROOT, SZ_WORKSPACE_NAME_TEMPLATE.
+Environment variables win over the config file.
+EOF
+}
+
+# sync-skill: push THIS repository's skill copy (the tool's own
+# skills/sz-dev) to the installed copy and to every registered
+# workspace's / replay tree's seeded skills/sz-dev. The repo copy is the
+# single source of truth for skill edits; this turns the three-way sync
+# into one verified command. Tracked skill files inside workspaces are
+# marked skip-worktree (the sz-replay init mechanism) so the seeded copy
+# never surfaces as a working-tree change; every target is verified with
+# diff -rq before success is reported.
+cmd_sync_skill() {
+    local src inst reg f name path dst top n=0
+    src="$(dirname "$(dirname "$(readlink -f "$0")")")"
+    inst="$(readlink -f "${SZ_SKILL_INSTALL_DIR:-$HOME/.zcode/skills/sz-dev}")"
+    [[ -f "$src/SKILL.md" ]] || { log "ERROR: $src is not a sz-dev skill dir"; exit 1; }
+    case "$src" in "$inst"|"$inst"/*)
+        log "ERROR: source is the installed copy ($src) — run this from the repository's skills/sz-dev (the repo copy is the source of truth)"
+        exit 1 ;;
+    esac
+    reg="$(registry_dir)"
+    local dsts=()
+    dsts+=("$inst")
+    for f in "$reg"/SZ*; do
+        [[ -f "$f" ]] || continue
+        name="$(basename "$f")"
+        case "$name" in *.mode|*.meta) continue ;; esac
+        path="$(cat "$f")"
+        if [[ -d "$path/.git" ]]; then
+            dsts+=("$(readlink -f "$path")/skills/sz-dev")
+        else
+            log "skip (not a checkout): $path"
+        fi
+    done
+    local dst top
+    for dst in ${dsts[@]+"${dsts[@]}"}; do
+        [[ "$dst" == "$src" || "$dst" == "$src"/* ]] && continue
+        mkdir -p "$dst"
+        # tracked skill files must not surface as working-tree changes:
+        # skip-worktree them (git then ignores the seeded copy)
+        top="$(git -C "$dst" rev-parse --show-toplevel 2>/dev/null || true)"
+        if [[ -n "$top" ]]; then
+            git -C "$top" ls-files -z -- skills/sz-dev 2>/dev/null \
+                | xargs -0 -r git -C "$top" update-index --skip-worktree -- 2>/dev/null || true
+        fi
+        rsync -a --delete --exclude __pycache__ "$src/" "$dst/" || { log "ERROR: rsync into $dst failed"; exit 1; }
+        if diff -rq --exclude __pycache__ "$src" "$dst" >/dev/null 2>&1; then
+            log "synced: $dst"
+            n=$((n + 1))
+        else
+            log "ERROR: $dst still differs after rsync"
+            exit 1
+        fi
+    done
+    echo "SYNCED=$n"
+}
+
+case "${1:-}" in
+    ensure)
+        shift
+        cmd_ensure "$@"
+        ;;
+    check)
+        shift
+        cmd_check "$@"
+        ;;
+    snapshot)
+        shift
+        cmd_snapshot "$@"
+        ;;
+    package)
+        shift
+        cmd_package "$@"
+        ;;
+    config)
+        [[ $# -le 1 ]] || usage
+        cmd_config
+        ;;
+    list)
+        [[ $# -le 2 ]] || usage
+        cmd_list "${2:-}"
+        ;;
+    remove)
+        shift
+        cmd_remove "$@"
+        ;;
+    sync-skill)
+        [[ $# -le 1 ]] || usage
+        cmd_sync_skill
+        ;;
+    mr)
+        shift
+        cmd_mr "$@"
+        ;;
+    *)
+        usage
+        ;;
+esac

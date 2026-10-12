@@ -1,0 +1,4 @@
+interface:
+  display_name: "Convert TC Wiki"
+  short_description: "Convert tester notes into English CciWiki source"
+  default_prompt: "Use $convert-tc-wiki to convert my completed test notes into paste-ready English CciWiki source."

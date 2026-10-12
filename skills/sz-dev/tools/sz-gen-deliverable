@@ -1,0 +1,280 @@
+#!/bin/bash
+
+# sz-gen-deliverable — deterministic artifact skeletons for sz-dev runs.
+# Every structured artifact the phase workflow files describe is emitted
+# from here, so section outlines stay in one place and runs cannot
+# freeform them into incompatible shapes. Fill every section; never
+# leave a placeholder in a section that applies.
+
+set -euo pipefail
+
+usage() {
+    echo "Usage: $0 <type> <SZxxxx> [title] [-o <path>]"
+    echo ""
+    echo "  rn|tc|cn|in   cciConnect deliverables (title required)"
+    echo "  phase1        Phase 1 requirement artifact outline (written for Phase 2)"
+    echo "  plan          Phase 2 plan skeleton (with the remediation-strategy table)"
+    echo "  review        Phase 2 review skeleton (two-part: self + independent)"
+    echo "  testplan      Phase 3 case-set skeleton (with the machine-review block)"
+    echo "  report        Phase 3 test-report skeleton (fixed format)"
+    echo ""
+    echo "Skeletons go to stdout, or straight onto disk with -o <path>"
+    echo "(.sz-dev/SZxxxx/<artifact>.md or deliverables/<TYPE>-SZxxxx.md);"
+    echo "-o refuses to overwrite a non-skeleton file (never destroy filled"
+    echo "work)."
+    exit 2
+}
+
+[[ $# -ge 2 ]] || usage
+
+TYPE="${1,,}"
+ARG="${2^^}"
+ID="${ARG#SZ}"
+shift 2
+
+OUT=""
+remaining=()
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o) [[ $# -ge 2 ]] || usage; OUT="$2"; shift 2 ;;
+        *) remaining+=("$1"); shift ;;
+    esac
+done
+TITLE="${remaining[0]:-}"
+
+[[ "$ID" =~ ^[0-9]+$ ]] || {
+    echo "ERROR: invalid SZ: $2"
+    exit 1
+}
+
+case "$TYPE" in
+    rn|tc|cn|in)
+        [[ -n "$TITLE" ]] || usage
+        ;;
+esac
+
+if [[ -n "$OUT" && -s "$OUT" ]]; then
+    if ! grep -qE '^<!--|^\s*[(](user-facing|prereq|step|subcase|next change|new dbitems|copy new|rcf values|daemon start|webframe test URL|machine)' "$OUT" 2>/dev/null \
+       && grep -qvE '^\s*$' "$OUT" && ! head -3 "$OUT" | grep -qE '^<[<(]'; then
+        echo "ERROR: $OUT exists and does not look like an unfilled skeleton — refusing to overwrite" >&2
+        exit 1
+    fi
+fi
+
+if [[ -n "$OUT" ]]; then
+    mkdir -p "$(dirname "$OUT")"
+    exec > "$OUT"
+fi
+
+case "$TYPE" in
+    rn)
+        # Shape taken from real RNs: short, user-facing changes, Note
+        # pointing at the FRD use case.
+        cat <<EOF
+SZ${ID}
+${TITLE}
+
+1. (user-facing change: what can now be done)
+Note: reference the FRD use case (US-xxxx) if the behavior is defined there.
+2. (next change)
+EOF
+        ;;
+    tc)
+        # Shape taken from real TCs: SoftZilla Title / Tested on /
+        # Preparation with grep verify / numbered subcases with Notes.
+        # Fill from the reviewed case set and executed results, never
+        # from an old TC.
+        cat <<EOF
+SoftZilla Title
+SZ${ID} ${TITLE}
+
+Test Case
+Tested on <machine>(<OS / build provenance, e.g. RHEL 8.8 / versioned dir>)
+Test link:
+<webframe test URL — for a backend/CLI run, replace with a one-line
+harness description: what drives the module (engine batch / runner
+command) and where the evidence lands>
+
+Preparation
+1. (prereq: permission / config / test data, with the verification command, e.g. grep)
+
+Test case
+<subcase 1: what is verified>
+1. (step)
+Note: (exception or expected detail that needs explaining)
+<subcase 2>
+1. (step)
+EOF
+        ;;
+    cn)
+        # Shape taken from real CNs: SZ line first, numbered steps,
+        # .dosu cp conf.template -> conf, grep/cat verify.
+        cat <<EOF
+SZ${ID}
+1. (copy new/changed choices)
+.dosu cp \$CCRUN/conf.template/<template path> \$CCRUN/conf/<path>
+2. (rcf values to set, in <file>.rcf)
+<Key>: <value>
+Verify:
+[<user>@<host>|fbch]:/fbch/fbch/run > grep '<Key>' <file>.rcf
+<Key>: <value>
+EOF
+        ;;
+    in)
+        # Shape taken from real INs: SZ line first, dbitems + LOADDBSHM,
+        # template copies, daemon restart sequence, Refer CN.
+        cat <<EOF
+SZ${ID}
+1. (new dbitems, if any: entries for master_dbshm.cf / site_dbshm.cf)
+.dosu LOADDBSHM
+2. (copy new/changed template directories)
+.dosu cp -r \$CCRUN/conf.template/<path> \$CCRUN/conf/<path>
+3. (daemon start / restart sequence)
+.dosu \$CCRUN/daemons/RESTART_<DAEMON>
+Refer CN${ID}
+Note: (ordering / timing pitfall, e.g. wait for background triggers)
+EOF
+        ;;
+    phase1)
+        # The required section outline for phase1-requirement.md — the
+        # verbatim headings Phase 2, the reviewer and gate 1 navigate by.
+        cat <<EOF
+# SZ${ID} Phase 1: Requirement
+
+## Requirement
+<!-- ticket facts + the problem restated in your own words; quote the
+     reporter's exact symptom wording and expected behavior verbatim -->
+
+## Requirement analysis
+<!-- symptom -> expected behavior; mechanism-level RCA on baseline code
+     (file + function + the exact expression that breaks); scope in/out;
+     BUG FIXES: list >=2 remediation strategies with their observable
+     behavior delta and pick the narrowest that removes the symptom —
+     any behavior the fix introduces that did not exist pre-fix must be
+     named here or escalated E1. Numbered acceptance criteria, each
+     decidable by test. -->
+
+## Prior art
+<!-- related SZs/commits: pattern to reuse or avoid (SZ + what) -->
+
+## Replay mode
+<!-- replay runs only: decision, FIX_COMMIT / BASELINE_COMMIT /
+     REPLAY_DIR / SZ_DEV_DIR, pack-exclusion list + degradation table;
+     delete the section on a normal run -->
+
+## Pack + routing
+<!-- module pack + why, track, layer, co-change candidates -->
+
+## Repro
+<!-- repro: red / n/a / manual (exact token) + driver-data provenance
+     line (driver data: ticket-verbatim | fixture <path> | hand-built +
+     mapping) -->
+
+## Clarifications
+<!-- BLOCKING vs NON-BLOCKING, with the chosen default -->
+
+## Light-path eligibility
+<!-- the six checks, each hold/fail; conclusion -->
+
+## Handoff
+<!-- files to read first, Phase 2's first action, open decisions -->
+EOF
+        ;;
+    plan)
+        # Phase 2 plan skeleton. The strategy table is mandatory for bug
+        # fixes (phase1 records the choice; this table keeps it visible
+        # to the reviewer).
+        cat <<EOF
+# SZ${ID} Phase 2 Plan
+
+## Remediation strategy (bug fixes; delete for feature SZs)
+<!-- >=2 options, each with blast radius and observable behavior delta;
+     chosen = the narrowest that removes the defect, reason stated -->
+| Option | Files | Behavior delta vs pre-fix | Chosen |
+|---|---|---|---|
+| (repair the affected path) | | | |
+| (bypass / guard at the caller) | | | |
+
+## Steps
+- [ ] Step 1: <what> — files: <paths>
+      verify: <the check this step must pass>
+
+## Changed paths
+<!-- appended (sorted, de-duplicated) to changed-paths.txt -->
+
+## Reused utilities / conventions
+<!-- shared utilities to reuse; patterns from prior art — followed or
+     deliberately differed -->
+
+## Risks / open questions
+<!-- each with the escalation id it would become if it blocks -->
+EOF
+        ;;
+    review)
+        # Two-part review file; sections are appended by their owners and
+        # never overwritten by the other.
+        cat <<EOF
+# SZ${ID} Phase 2 Review
+
+## Reviewer context
+<!-- who reviewed; same-context limitation if any -->
+
+## Self-review
+<!-- the implementer's own pass over the diff -->
+### Four criteria
+<!-- requirement met / style / minimal / quality — each PASS or FAIL
+     with evidence; include the strategy-narrowness check: does the fix
+     introduce observable behavior beyond the symptom's removal? -->
+### Findings
+<!-- P0/P1/P2, each: location, why it matters, fixed-in-place or recorded -->
+
+## Independent review
+<!-- fresh-context reviewer: findings with severity + evidence;
+     strategy-narrowness verdict; replay-exclusion compliance;
+     re-review required: yes/no -->
+### Verdict
+<!-- pass | pass-with-P2 | rework-needed -->
+EOF
+        ;;
+    testplan)
+        # Phase 3 case-set skeleton; sources 1-2 map one-to-one to FRD
+        # points / the defect symptom, 3-4 are labeled regression.
+        cat <<EOF
+# SZ${ID} Phase 3 Test Plan
+
+## Cases
+<!-- per case: id | source label (repro | frd | regression (diff-derived)
+     | regression (same-family) | manual track) | input + provenance |
+     machine-decidable assertions (never "looks right") -->
+
+## Machine review (Step 2) — verdict:
+<!-- (a) coverage: one-to-one for sources 1-2, labels for 3-4, no orphans
+     (b) decidability (c) write-path safety: backup + restore + teardown,
+     loud teardown failure -->
+
+## TC wiki
+<!-- path + validator pass, recorded before execution -->
+EOF
+        ;;
+    report)
+        cat <<EOF
+# SZ${ID} Phase 3 Test Report
+
+Environment: <host, build provenance, date>
+
+## Cases
+<!-- per case: PASS / FAIL / NOT-RUN with evidence — the command run and
+     the decisive output (captured file paths); manual-track parts marked
+     NOT EXECUTED, never passed -->
+
+## Teardown verification
+<!-- every write-path case shows the verify-clean result -->
+
+## Summary
+<!-- counts + fix rounds consumed -->
+EOF
+        ;;
+    *)
+        usage
+        ;;
+esac

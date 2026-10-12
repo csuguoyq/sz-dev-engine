@@ -1,0 +1,4 @@
+interface:
+  display_name: "Git Change Packaging Check"
+  short_description: "Package Git code changes, generate a file list, and verify three-way consistency"
+  default_prompt: "Use $package-git-changes to package this repository's Git changes and verify the archive against the file list."

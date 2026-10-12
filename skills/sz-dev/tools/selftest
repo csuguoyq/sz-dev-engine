@@ -1,0 +1,401 @@
+#!/bin/bash
+
+# selftest — behavior-level regression tests for the sz-dev tools.
+#
+# Everything here is synthetic: fake engines (/bin/sleep, /bin/cat, /bin/env),
+# a throwaway git repo, a throwaway registry. No real engine, no DB, no
+# network, no ticket system — safe to run anywhere, any time (a full run
+# takes a few seconds). sz-doctor executes it as part of every health
+# check; run it standalone after changing any tool:
+#
+#   bash "$SKILL_DIR/tools/selftest"
+#
+# Exit: 0 all pass, 1 any failure. Each check prints PASS/FAIL with a tag.
+
+set -u
+
+# no cd/pwd capture here: agent-shell cd hooks print to stdout and would
+# poison the substitution (a newline in SELF_DIR breaks every invocation)
+SELF_DIR="$(dirname "$(readlink -f "$0")")"
+CQL_RUN="bash $SELF_DIR/cql-run"
+SZ_REPLAY="bash $SELF_DIR/sz-replay"
+
+PASS=0; FAIL=0
+ok()   { PASS=$((PASS+1)); echo "PASS  $1"; }
+fail() { FAIL=$((FAIL+1)); echo "FAIL  $1"; }
+
+# expect_rc <want-rc> <tag> <cmd...>
+expect_rc() {
+    local want="$1" tag="$2"; shift 2
+    "$@" >/dev/null 2>&1
+    local got=$?
+    if [ "$got" -eq "$want" ]; then ok "$tag"; else fail "$tag (rc=$got, want $want)"; fi
+}
+# expect_grep <pattern> <tag> <cmd...>  (stdout+stderr)
+expect_grep() {
+    local pattern="$1" tag="$2"; shift 2
+    if "$@" 2>&1 | grep -q "$pattern"; then ok "$tag"; else fail "$tag (pattern not found: $pattern)"; fi
+}
+# expect_line <file> <tag> <expected-line>
+expect_line() {
+    local file="$1" tag="$2" want="$3"
+    if [ "$(cat "$file" 2>/dev/null)" = "$want" ]; then ok "$tag"; else fail "$tag (got '$(cat "$file" 2>/dev/null)', want '$want')"; fi
+}
+
+SANDBOX="$(mktemp -d /tmp/sz-dev-selftest.XXXXXX)"
+trap 'rm -rf "$SANDBOX"' EXIT
+
+# ---------- Part A: cql-run (fake engines; CCRUN points anywhere, CCRUN_BIN wins) ----------
+export CCRUN="$SANDBOX/ccrun"          # never a real engine; CCRUN_BIN overrides the binary
+mkdir -p "$CCRUN"
+
+expect_rc 2  "cql-run: no args prints usage" $CQL_RUN
+expect_grep "REFUSED" "cql-run: CCRUN refusal message" env -u CCRUN $CQL_RUN -- -b -n
+expect_rc 125 "cql-run: refuses without CCRUN" env -u CCRUN $CQL_RUN -- -b -n
+expect_rc 125 "cql-run: refuses non-executable engine" $CQL_RUN -- -b -n
+
+expect_grep "hello" "cql-run: fake engine runs (echo)" env CCRUN_BIN=/bin/echo $CQL_RUN -- hello
+expect_rc 125 "cql-run: long-line stdin refused" bash -c "python3 -c \"print('x'*1000)\" | CCRUN=$CCRUN CCRUN_BIN=/bin/cat $CQL_RUN -- -"
+rc=$(python3 -c "
+for i in range(10): print('x'*700)" | CCRUN="$CCRUN" CCRUN_BIN=/bin/cat $CQL_RUN -- - >/dev/null 2>&1; echo $?)
+if [ "$rc" -eq 0 ]; then ok "cql-run: well-formed stdin passes"; else fail "cql-run: well-formed stdin passes (rc=$rc)"; fi
+expect_rc 124 "cql-run: timeout kills engine" env CCRUN_BIN=/bin/sleep $CQL_RUN --timeout 1 -- 30
+rc=$(python3 -c "
+for i in range(3000): print('x'*700)" | CCRUN="$CCRUN" CCRUN_BIN=/bin/cat CQL_MAX_OUT_MB=1 $CQL_RUN -- - >/dev/null 2>&1; echo $?)
+if [ "$rc" -eq 153 ]; then ok "cql-run: output cap kills engine (SIGXFSZ)"; else fail "cql-run: output cap kills engine (rc=$rc, want 153)"; fi
+env FOO= CCRUN_BIN=/usr/bin/env $CQL_RUN --env FOO=bar -- -u NOPE 2>/dev/null | grep -q '^FOO=bar$' \
+    && ok "cql-run: --env exports the variable" || fail "cql-run: --env exports the variable"
+
+# ---------- Part B: sz-replay (throwaway git repo + registry) ----------
+export SZ_WORKSPACE_REGISTRY="$SANDBOX/registry"
+export SZ_WORKSPACE_DIR="$SANDBOX/repo"      # SZ_WORKSPACE_DIR IS the git repo
+mkdir -p "$SZ_WORKSPACE_REGISTRY" "$SZ_WORKSPACE_DIR"
+git -C "$SZ_WORKSPACE_DIR" init -q
+git -C "$SZ_WORKSPACE_DIR" config user.email t@t
+git -C "$SZ_WORKSPACE_DIR" config user.name t
+mkdir "$SZ_WORKSPACE_DIR/cql"
+echo one > "$SZ_WORKSPACE_DIR/cql/a.scm"
+git -C "$SZ_WORKSPACE_DIR" add -A
+git -C "$SZ_WORKSPACE_DIR" commit -qm one
+echo two >> "$SZ_WORKSPACE_DIR/cql/a.scm"
+git -C "$SZ_WORKSPACE_DIR" add -A
+git -C "$SZ_WORKSPACE_DIR" commit -qm two
+FIX="$(git -C "$SZ_WORKSPACE_DIR" rev-parse HEAD)"
+# sz-replay places the tree at dirname(repo)/replay-SZxxxx (sibling of the repo)
+REPO="$SANDBOX/replay-SZ00001"
+STATE="$REPO/.sz-dev/SZ00001"
+
+$SZ_REPLAY init SZ00001 "$FIX" >/dev/null 2>&1 \
+    && ok "sz-replay: init creates the replay tree" || fail "sz-replay: init creates the replay tree"
+BASE_SHA="$(sed -n 's/^baseline=//p' "$SZ_WORKSPACE_REGISTRY/replay-SZ00001.meta")"
+[ -d "$REPO/.git" ] \
+    && [ "$(git -C "$REPO" rev-parse HEAD)" = "$BASE_SHA" ] \
+    && ok "sz-replay: replay tree is a clone detached at baseline" || fail "sz-replay: replay tree is a clone detached at baseline"
+
+echo modified >> "$REPO/cql/a.scm"
+mkdir -p "$STATE/checkpoints"
+echo "cql/a.scm" > "$STATE/changed-paths.txt"
+$SZ_REPLAY diff SZ00001 > "$STATE/checkpoints/SZ00001_gate2.patch" 2>/dev/null || true
+echo "plan: change a.scm" > "$STATE/phase2-plan.md"
+echo "notes: FIX_COMMIT=$FIX recorded" > "$STATE/progress.md"
+
+names=$($SZ_REPLAY diff SZ00001 --names 2>/dev/null)
+if [ "$names" = "cql/a.scm" ]; then ok "sz-replay: diff --names is a clean path list"; else fail "sz-replay: diff --names is a clean path list (got '$names')"; fi
+
+expect_rc 0 "sz-replay: verify passes on the reviewed tree" $SZ_REPLAY verify SZ00001
+echo hacked >> "$REPO/cql/a.scm"
+expect_rc 1 "sz-replay: verify fails after post-review code change" $SZ_REPLAY verify SZ00001
+# restore tree to the gate-2 state (drop the appended line)
+python3 - "$REPO/cql/a.scm" << 'PYEOF'
+import sys
+path = sys.argv[1]
+lines = open(path).read().splitlines(keepends=True)
+open(path, "w").write("".join(lines[:-1]))
+PYEOF
+
+expect_rc 0 "sz-replay: audit clean when the sha is confined to bookkeeping files" $SZ_REPLAY audit SZ00001
+echo "copied from attachment 99887" >> "$STATE/phase2-plan.md"
+expect_rc 1 "sz-replay: audit detects a --forbid token outside bookkeeping" $SZ_REPLAY audit SZ00001 --forbid 99887
+python3 - "$STATE/phase2-plan.md" << 'PYEOF'
+import sys
+path = sys.argv[1]
+lines = open(path).read().splitlines(keepends=True)
+open(path, "w").write("".join(lines[:-1]))
+PYEOF
+
+expect_rc 1 "sz-replay: finish refuses while .md state remains" $SZ_REPLAY finish SZ00001
+cp -a "$REPO/.sz-dev" "$SANDBOX/copy"
+echo tampered > "$SANDBOX/copy/SZ00001/phase2-plan.md"
+expect_rc 1 "sz-replay: finish --copied-to refuses a tampered copy" $SZ_REPLAY finish SZ00001 --copied-to "$SANDBOX/copy"
+[ -d "$REPO" ] && ok "sz-replay: refused finish keeps the tree" || fail "sz-replay: refused finish keeps the tree"
+rm -rf "$SANDBOX/copy"; cp -a "$REPO/.sz-dev" "$SANDBOX/copy"
+expect_rc 0 "sz-replay: finish --copied-to verifies + clears + deletes" $SZ_REPLAY finish SZ00001 --copied-to "$SANDBOX/copy"
+[ ! -d "$REPO" ] && ok "sz-replay: finish removes the replay tree" || fail "sz-replay: finish removes the replay tree"
+
+# ---------- Part C: exclusions (names-only grep, against this skill's own references) ----------
+mkdir -p "$SANDBOX/exrepo/cql" "$SANDBOX/exrepo/skills/sz-dev/references/cql"
+git -C "$SANDBOX/exrepo" init -q
+echo "hit SZ424242 here" > "$SANDBOX/exrepo/skills/sz-dev/references/cql/repro.md"
+echo "no number here" > "$SANDBOX/exrepo/skills/sz-dev/references/cql/other.md"
+(cd "$SANDBOX/exrepo" && env -u SZ_WORKSPACE_DIR $SZ_REPLAY exclusions SZ424242 2>/dev/null) > "$SANDBOX/excl.out"
+if [ "$(cat "$SANDBOX/excl.out")" = "skills/sz-dev/references/cql/repro.md" ]; then
+    ok "sz-replay: exclusions lists only the hit file (names, not content)"
+else
+    fail "sz-replay: exclusions lists only the hit file (got '$(cat "$SANDBOX/excl.out")')"
+fi
+expect_grep "1 file(s) OUT OF BOUNDS" "sz-replay: exclusions reports the count on stderr" bash -c "cd '$SANDBOX/exrepo' && env -u SZ_WORKSPACE_DIR $SZ_REPLAY exclusions SZ424242" 2>&1
+
+# ---------- Part D: standard workspace/replay layout ({user}_sz{n}_ai) ----------
+user="$(id -un | tr 'A-Z' 'a-z')"
+STD_REPO="$SANDBOX/${user}_sz00009_ai/ccsrc"
+mkdir -p "$STD_REPO"
+git -C "$STD_REPO" init -q
+git -C "$STD_REPO" config user.email t@t
+git -C "$STD_REPO" config user.name t
+mkdir "$STD_REPO/cql"
+echo one > "$STD_REPO/cql/a.scm"
+git -C "$STD_REPO" add -A
+git -C "$STD_REPO" commit -qm one
+echo two >> "$STD_REPO/cql/a.scm"
+git -C "$STD_REPO" add -A
+git -C "$STD_REPO" commit -qm two
+(
+    cd "$SANDBOX" && env SZ_WORKSPACE_DIR="$STD_REPO" \
+        SZ_WORKSPACE_REGISTRY="$SANDBOX/registry" $SZ_REPLAY init SZ00009 \
+        "$(git -C "$STD_REPO" rev-parse HEAD)" >/dev/null 2>&1
+)
+[ -d "$SANDBOX/${user}_sz00009_aireplay/ccsrc/cql" ] \
+    && ok "sz-replay: standard layout replays at {user}_sz{n}_aireplay/ccsrc" \
+    || fail "sz-replay: standard layout replays at {user}_sz{n}_aireplay/ccsrc"
+(
+    cd "$SANDBOX" && env SZ_WORKSPACE_DIR="$STD_REPO" \
+        SZ_WORKSPACE_REGISTRY="$SANDBOX/registry" $SZ_REPLAY finish SZ00009 --force >/dev/null 2>&1
+)
+[ ! -d "$SANDBOX/${user}_sz00009_aireplay" ] \
+    && ok "sz-replay: finish removes the whole _aireplay project dir" \
+    || fail "sz-replay: finish removes the whole _aireplay project dir"
+
+# ---------- Part E: sz-preflight self-location (CDPATH + relative + PATH) ----
+# The historical bug: a relative invocation with CDPATH set made `cd` echo
+# the CDPATH hit into the SKILL_DIR substitution (two lines -> bogus tool
+# paths -> false "missing from skill dir" FAILs -> the run stops). The
+# tool-health lines must pass in every documented invocation style,
+# regardless of the network checks' outcome.
+PF_ENV="CDPATH=.:/nonexistent-selftest-path"
+pf_out="$(cd "$SELF_DIR/.." && env $PF_ENV bash tools/sz-preflight 2>&1)"
+echo "$pf_out" | grep -q "PASS  tools/sz-progress: usage prints" \
+    && ok "sz-preflight: relative invocation resolves tools (CDPATH armed)" \
+    || fail "sz-preflight: relative invocation resolves tools (CDPATH armed)"
+echo "$pf_out" | grep -q "missing from skill dir" \
+    && fail "sz-preflight: no false 'missing from skill dir' FAIL" \
+    || ok "sz-preflight: no false 'missing from skill dir' FAIL"
+
+pf_out="$(cd "$SANDBOX" && env PATH="$SELF_DIR:$PATH" $PF_ENV sz-preflight 2>&1)"
+echo "$pf_out" | grep -q "PASS  tools/sz-workspace: usage prints" \
+    && ok "sz-preflight: bare-name PATH invocation resolves tools" \
+    || fail "sz-preflight: bare-name PATH invocation resolves tools (exec bit present?)"
+
+pf_out="$(env SZ_DEV_SKILL_DIR="$(dirname "$SELF_DIR")" $PF_ENV \
+    bash "$SELF_DIR/sz-preflight" 2>&1)"
+echo "$pf_out" | grep -q "PASS  tools/sz-progress: usage prints" \
+    && ok "sz-preflight: SZ_DEV_SKILL_DIR override wins" \
+    || fail "sz-preflight: SZ_DEV_SKILL_DIR override wins"
+
+# ---------- Part F: sz-verify-tree (no-commit anchor + change-scope) ---------
+SZVT="bash $SELF_DIR/sz-verify-tree"
+VT_REG="$SANDBOX/vt-registry"
+VT_REPO="$SANDBOX/vt-repo"
+mkdir -p "$VT_REG" "$VT_REPO/.sz-dev/SZ00042"
+git -C "$VT_REPO" init -q
+git -C "$VT_REPO" config user.email t@t
+git -C "$VT_REPO" config user.name t
+mkdir "$VT_REPO/cql"
+echo one > "$VT_REPO/cql/a.scm"
+git -C "$VT_REPO" add -A
+git -C "$VT_REPO" commit -qm one
+VT_BASE="$(git -C "$VT_REPO" rev-parse HEAD)"
+printf 'phase: 2\nbase: %s\n' "$VT_BASE" > "$VT_REPO/.sz-dev/SZ00042/progress.md"
+echo "cql/a.scm" > "$VT_REPO/.sz-dev/SZ00042/changed-paths.txt"
+echo "$VT_REPO" > "$VT_REG/SZ00042"
+VT_ENV="SZ_DEV_DIR=$VT_REPO/.sz-dev SZ_WORKSPACE_REGISTRY=$VT_REG"
+
+echo modified >> "$VT_REPO/cql/a.scm"
+expect_rc 0 "sz-verify-tree: clean tree passes" env $VT_ENV $SZVT SZ00042
+
+expect_rc 2 "sz-verify-tree: refuses a replay run" env SZ_WORKSPACE_REGISTRY="$VT_REG" \
+    bash -c "echo replay > '$VT_REG/SZ00042.mode' && $SELF_DIR/sz-verify-tree SZ00042"
+rm -f "$VT_REG/SZ00042.mode"
+
+touch "$VT_REPO/stray.txt"
+expect_rc 1 "sz-verify-tree: stray file fails" env $VT_ENV $SZVT SZ00042
+touch "$VT_REPO/.sz-dev/.shared-inplace"
+expect_grep "shared checkout" "sz-verify-tree: shared checkout downgrades strays" \
+    env $VT_ENV $SZVT SZ00042
+expect_rc 0 "sz-verify-tree: shared strays are warnings, not failures" env $VT_ENV $SZVT SZ00042
+rm -f "$VT_REPO/stray.txt" "$VT_REPO/.sz-dev/.shared-inplace"
+
+echo "cql/b.scm" >> "$VT_REPO/.sz-dev/SZ00042/changed-paths.txt"
+expect_grep "planned paths with no working-tree change" \
+    "sz-verify-tree: untouched planned path warns" env $VT_ENV $SZVT SZ00042
+sed -i '$d' "$VT_REPO/.sz-dev/SZ00042/changed-paths.txt"
+
+git -C "$VT_REPO" add -A
+git -C "$VT_REPO" commit -qm two
+expect_rc 1 "sz-verify-tree: HEAD drift fails (no-commit anchor)" env $VT_ENV $SZVT SZ00042
+
+# ---------- Part G: sz-workspace snapshot + package (synthetic workspace) ---
+SZWS="bash $SELF_DIR/sz-workspace"
+WS_REG="$SANDBOX/ws-registry"
+WS_REPO="$SANDBOX/guoyq_ws00007_ai/ccsrc"
+mkdir -p "$WS_REG" "$WS_REPO/.sz-dev/SZ00007"
+git -C "$WS_REPO" init -q
+git -C "$WS_REPO" config user.email t@t
+git -C "$WS_REPO" config user.name t
+mkdir "$WS_REPO/cql"
+echo one > "$WS_REPO/cql/a.scm"
+git -C "$WS_REPO" add -A
+git -C "$WS_REPO" commit -qm one
+echo "$WS_REPO" > "$WS_REG/SZ00007"
+echo "cql/a.scm" > "$WS_REPO/.sz-dev/SZ00007/changed-paths.txt"
+echo modified >> "$WS_REPO/cql/a.scm"
+
+snap_out="$(SZ_WORKSPACE_REGISTRY="$WS_REG" $SZWS snapshot SZ00007 2>&1)"
+echo "$snap_out" | grep -q "checkpoints/step-01-pre.patch" \
+    && ok "sz-workspace snapshot: deterministic step label + patch written" \
+    || fail "sz-workspace snapshot: deterministic step label + patch written"
+[ -s "$WS_REPO/.sz-dev/SZ00007/checkpoints/step-01-pre.patch" ] \
+    && ok "sz-workspace snapshot: patch is non-empty (planned file captured)" \
+    || fail "sz-workspace snapshot: patch is non-empty (planned file captured)"
+snap2="$(SZ_WORKSPACE_REGISTRY="$WS_REG" $SZWS snapshot SZ00007 2>&1)"
+echo "$snap2" | grep -q "step-02-pre.patch" \
+    && ok "sz-workspace snapshot: second call auto-increments the label" \
+    || fail "sz-workspace snapshot: second call auto-increments the label"
+
+pkg_out="$(SZ_WORKSPACE_REGISTRY="$WS_REG" $SZWS package SZ00007 --out "$SANDBOX" 2>&1)"
+echo "$pkg_out" | grep -q "PACKAGE=" \
+    && ok "sz-workspace package: PACKAGE= line emitted" \
+    || fail "sz-workspace package: PACKAGE= line emitted"
+pkg_file="$(printf '%s\n' "$pkg_out" | sed -n 's/^PACKAGE=//p')"
+[ -f "$pkg_file" ] && [ "$(tar tzf "$pkg_file")" = "cql/a.scm" ] \
+    && ok "sz-workspace package: tar contains exactly the plan∩diff set" \
+    || fail "sz-workspace package: tar contains exactly the plan∩diff set"
+SZ_WORKSPACE_REGISTRY="$WS_REG" $SZWS package SZ00007 --out "$SANDBOX" >/dev/null 2>&1
+tar tzf "$(printf '%s\n' "$pkg_out" | sed -n 's/^PACKAGE=//p')" | grep -q '\.sz-dev' \
+    && fail "sz-workspace package: no .sz-dev leakage" \
+    || ok "sz-workspace package: no .sz-dev leakage"
+
+# ---------- Part H: sz-replay audit auto-exempts driver-data attachments ----
+# The observed failure: the caller --forbids the INPUT attachment (its id
+# sits in phase1's `driver data:` line — in-bounds by declaration) and
+# every artifact with driver provenance false-positives. The fix: audit
+# drops ids declared on `driver data:` lines from the token set, while
+# ids mentioned elsewhere (exclusion narratives) stay scannable.
+AU_REG="$SANDBOX/au-registry"
+AU_REPO="$SANDBOX/au-repo"
+mkdir -p "$AU_REG" "$AU_REPO/.sz-dev/SZ00043"
+git -C "$AU_REPO" init -q
+git -C "$AU_REPO" config user.email t@t
+git -C "$AU_REPO" config user.name t
+mkdir "$AU_REPO/cql"
+echo one > "$AU_REPO/cql/a.scm"
+git -C "$AU_REPO" add -A
+git -C "$AU_REPO" commit -qm one
+echo two >> "$AU_REPO/cql/a.scm"
+git -C "$AU_REPO" add -A
+git -C "$AU_REPO" commit -qm two
+AU_FIX="$(git -C "$AU_REPO" rev-parse HEAD)"
+printf '%s\n' "$AU_REPO" > "$AU_REG/SZ00043"
+SZ_WORKSPACE_REGISTRY="$AU_REG" $SZ_REPLAY init SZ00043 "$AU_FIX" >/dev/null 2>&1
+printf 'phase: 2\n' > "$AU_REPO/.sz-dev/SZ00043/progress.md"
+# audit scans the REPLAY tree's state (legacy layout clones to replay-SZxxxx)
+mkdir -p "$SANDBOX/replay-SZ00043/.sz-dev/SZ00043"
+printf '## Repro\n\ndriver data: ticket-verbatim (attachment 55500)\n' \
+    > "$SANDBOX/replay-SZ00043/.sz-dev/SZ00043/phase1-requirement.md"
+au() { SZ_WORKSPACE_REGISTRY="$AU_REG" $SZ_REPLAY audit SZ00043 "$@" 2>&1; }
+au --forbid 55500 | grep -q "exempted" \
+    && ok "sz-replay audit: driver-data attachment auto-exempted" \
+    || fail "sz-replay audit: driver-data attachment auto-exempted"
+au --forbid 55500 >/dev/null 2>&1 \
+    && ok "sz-replay audit: exempted token does not fail the run" \
+    || fail "sz-replay audit: exempted token does not fail the run"
+echo "attachment 55500 leaked here" > "$AU_REPO/.sz-dev/SZ00043/phase2-plan.md"
+au --forbid 99999 | grep -q "CONTAMINATION" \
+    && fail "sz-replay audit: non-declared token stays forbidden" \
+    || ok "sz-replay audit: non-declared token stays forbidden"
+SZ_WORKSPACE_REGISTRY="$AU_REG" $SZ_REPLAY finish SZ00043 --force >/dev/null 2>&1
+
+# ---------- sz-progress gate 1: repro conclusion anchored to its line ----------
+# The red-check must read only a conclusion line (start of line, optional
+# list/quote marker) — prose mentioning the token mid-sentence must not read
+# as the conclusion (observed: an explanatory "(... required only for
+# repro: red.)" note tripped the unanchored grep and failed a manual run).
+SZP="bash $SELF_DIR/sz-progress"
+gate1_env() { local root="$1"; shift; SZ_DEV_DIR="$root" $SZP "$@"; }
+gate1_setup() { # $1=SZ state dir  $2=artifact body
+    mkdir -p "$1/attachment"
+    printf '%s\n' "$2" > "$1/phase1-requirement.md"
+    printf 'ticket body\n' > "$1/attachment/ticket-body.md"
+    printf 'ticket comments\n' > "$1/attachment/ticket-comments.md"
+}
+GP1="$SANDBOX/gp1/.sz-dev/SZ100001"; GP2="$SANDBOX/gp2/.sz-dev/SZ100002"
+gate1_setup "$GP1" 'repro: manual
+
+(Prose note: a driver data line is required only for repro: red, not here.)'
+gate1_setup "$GP2" 'repro: red'
+for gp in "$GP1" "$GP2"; do
+    id="$(basename "$gp")"
+    gate1_env "$(dirname "$gp")" init "$id" >/dev/null 2>&1
+    gate1_env "$(dirname "$gp")" set "$id" phase 1 >/dev/null 2>&1
+done
+# gp1: manual conclusion + prose red-mention, no driver data -> gate 1 passes
+gate1_env "$(dirname "$GP1")" set SZ100001 gate 1 passed >/dev/null 2>&1 \
+    && ok "sz-progress gate 1: prose red-mention does not require driver data" \
+    || fail "sz-progress gate 1: prose red-mention does not require driver data"
+# gp2: bare red conclusion without driver data -> gate 1 refuses
+gate1_env "$(dirname "$GP2")" set SZ100002 gate 1 passed >/dev/null 2>&1 \
+    && fail "sz-progress gate 1: red without driver data still refused" \
+    || ok "sz-progress gate 1: red without driver data still refused"
+# gp2 with the driver-data line -> passes (the strong path stays enforced)
+printf 'repro: red\n\ndriver data: ticket-verbatim\n' > "$GP2/phase1-requirement.md"
+gate1_env "$(dirname "$GP2")" set SZ100002 gate 1 passed >/dev/null 2>&1 \
+    && ok "sz-progress gate 1: red + driver data passes" \
+    || fail "sz-progress gate 1: red + driver data passes"
+# gp3: red conclusion + the rule's option list quoted mid-line in prose must
+# NOT satisfy the provenance requirement (mirror-image false negative)
+GP3="$SANDBOX/gp3/.sz-dev/SZ100003"
+gate1_setup "$GP3" 'repro: red
+
+Allowed values: driver data: ticket-verbatim | fixture <path> | hand-built + mapping.'
+gate1_env "$(dirname "$GP3")" init SZ100003 >/dev/null 2>&1
+gate1_env "$(dirname "$GP3")" set SZ100003 phase 1 >/dev/null 2>&1
+gate1_env "$(dirname "$GP3")" set SZ100003 gate 1 passed >/dev/null 2>&1 \
+    && fail "sz-progress gate 1: prose-quoted driver-data options do not satisfy" \
+    || ok "sz-progress gate 1: prose-quoted driver-data options do not satisfy"
+
+# ---------- sz-workspace sync-skill ----------
+SS_REG="$SANDBOX/ss-reg"; SS_INST="$SANDBOX/ss-inst/skills/sz-dev"; SS_WS="$SANDBOX/ss-ws"
+SS_SRC="$(dirname "$SELF_DIR")"
+mkdir -p "$SS_REG" "$SS_INST" "$SS_WS"
+git -C "$SS_WS" init -q >/dev/null 2>&1 || true
+printf '%s\n' "$SS_WS" > "$SS_REG/SZ00077"
+printf 'stale\n' > "$SS_INST/tools/stale.txt"
+mkdir -p "$SS_WS/skills/sz-dev/tools"
+printf 'stale\n' > "$SS_WS/skills/sz-dev/tools/stale.txt"
+SS_OUT="$(SZ_WORKSPACE_REGISTRY="$SS_REG" SZ_SKILL_INSTALL_DIR="$SS_INST" \
+    bash "$SELF_DIR/sz-workspace" sync-skill 2>/dev/null)"
+[ "$SS_OUT" = "SYNCED=2" ] \
+    && ok "sz-workspace sync-skill: reports 2 targets" \
+    || fail "sz-workspace sync-skill: reports 2 targets (got: $SS_OUT)"
+[ ! -e "$SS_INST/tools/stale.txt" ] && [ -f "$SS_INST/SKILL.md" ] \
+    && ok "sz-workspace sync-skill: installed copy refreshed (--delete)" \
+    || fail "sz-workspace sync-skill: installed copy refreshed (--delete)"
+[ ! -e "$SS_WS/skills/sz-dev/tools/stale.txt" ] && [ -f "$SS_WS/skills/sz-dev/SKILL.md" ] \
+    && ok "sz-workspace sync-skill: workspace seeded copy refreshed" \
+    || fail "sz-workspace sync-skill: workspace seeded copy refreshed"
+diff -rq "$SS_SRC" "$SS_INST" >/dev/null 2>&1 \
+    && ok "sz-workspace sync-skill: installed copy matches source" \
+    || fail "sz-workspace sync-skill: installed copy matches source"
+
+# ---------- summary ----------
+echo "tools selftest: $PASS pass, $FAIL fail"
+[ "$FAIL" -eq 0 ]

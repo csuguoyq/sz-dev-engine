@@ -1,0 +1,14 @@
+{
+  "$comment": "Prefer `node ai-flow/dist/cli.js init` at the repository root. agent is one of cursor, claude, chatgpt, deepseek, zcode, opencode. model is optional; an empty string keeps that CLI's own default. A file with only runner.command still runs: tokens are {promptStdin}, {promptArg}, {promptFile}, {cwd}, {model}; optional runner.modelFlag (default -m), runner.modelsCommand, and runner.statusCommand ({dir} is the workspace). Do not put cookies in this file. szdev.skillDir defaults to <repo>/skills/sz-dev; szdev.pack is the fallback module pack when phase 1 does not record one. The ticket is fetched by the agent through its configured softzilla MCP.",
+  "agent": "cursor",
+  "model": "",
+  "szdev": {
+    "skillDir": "skills/sz-dev",
+    "pack": "cql"
+  },
+  "ui": {
+    "host": "0.0.0.0",
+    "port": 4173,
+    "token": ""
+  }
+}

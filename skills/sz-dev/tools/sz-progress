@@ -1,0 +1,546 @@
+#!/bin/bash
+
+# sz-progress — phase / gate state machine for sz-dev runs.
+#
+# State root resolution (first hit wins):
+#   1. $SZ_DEV_DIR (explicit override);
+#   2. the nearest existing .sz-dev/ at or above the current directory
+#      (the normal case: the session has cd'd into the Phase 0 workspace);
+#   3. the sz-workspace registry entry ~/.sz-dev-workspaces/SZxxxx.
+# init refuses to create state outside a resolved workspace — a stray cwd
+# must never fork a second state tree silently.
+
+set -euo pipefail
+
+usage() {
+    cat <<EOF
+Usage:
+  $0 init <SZxxxx>
+  $0 show <SZxxxx>
+  $0 set  <SZxxxx> phase <1-4|aborted> [--force]
+  $0 set  <SZxxxx> gate <1-4> <pending|passed|rejected> [--force]
+  $0 set  <SZxxxx> meta <mode|track|slice|base|package> <value>
+  $0 awaiting <SZxxxx> <E-id|clear>
+  $0 constraint <SZxxxx> <text...>
+  $0 note <SZxxxx> <text...>
+  $0 bump <SZxxxx>          increment the fix-round counter (per phase)
+
+State model:
+  phase moves forward 0->4, but may also move BACKWARD: setting
+  phase N while the current phase is M > N resets gates N..4 to
+  pending, clears awaiting, and logs the return as a note (the work
+  of phases N..M is being redone, so every downstream gate must be
+  re-passed). phase may be set to "aborted" to stop the SZ; a later
+  "set phase <n>" logs a resume.
+  Invariants (refused with a message, never applied silently):
+  - "set phase N" (forward) requires gate(N-1) = passed;
+    --force overrides and records a note.
+  - "set gate N passed" requires phase >= N AND gate 1..N-1 all
+    passed (gates cannot be skipped); --force overrides and
+    records a note.
+  - "set gate 1 passed" requires phase1-requirement.md to exist and mention the
+    repro conclusion; "set gate 2 passed" requires the plan
+    (phase2-plan*.md) and phase2-review.md on disk; "set gate 3 passed"
+    requires phase3-test-plan.md and phase3-test-report.md on disk —
+    evidence before milestone.
+  - "set phase" (forward) and "set gate passed" refuse while an
+    escalation is open (awaiting is set), except with --force
+    (a note is recorded).
+  gate states: pending (default) | passed | rejected (the human
+  turned the gate down; redo the work, re-present, then passed).
+  awaiting: empty, or the id of the open escalation (E1-E7,
+  SKILL.md) blocking the current phase. Resume re-presents that
+  question only; "awaiting clear" records the answer arrived.
+  meta keys: mode: file|orchestrated; track: auto|manual (derived
+  from the pack's capabilities — manual means gates must
+  distinguish "AI executed" from "rendered for a human");
+  slice: <n>/<m> for large-SZ slices. base: the workspace HEAD sha
+  recorded at Phase 0 — the no-commit anchor that sz-verify-tree
+  asserts at gates 2 and 4 (set once; a changed value is allowed
+  but loudly noted). package: the delivery tarball path recorded by
+  Phase 4 Step 3.5 — gate 4 requires it, and the file must exist
+  when it is set. rounds counts fix rounds within
+  the current phase (incremented by "bump", reset to 0 whenever the
+  phase changes), so the 2-round cap survives a crash without one
+  phase's spend eating the next phase's budget.
+  constraints: first-class human-imposed limits (e.g. "no sudo",
+  "base on the current checkout"). Recorded with 'constraint' and
+  re-read first on every resume.
+EOF
+    exit 2
+}
+
+[[ $# -ge 2 ]] || usage
+
+CMD="$1"
+ARG="${2^^}"
+ID="${ARG#SZ}"
+
+[[ "$ID" =~ ^[0-9]+$ ]] || {
+    echo "ERROR: invalid SZ: $2"
+    exit 1
+}
+
+# ---- state root resolution ----
+
+registry_dir() { printf '%s\n' "${SZ_WORKSPACE_REGISTRY:-$HOME/.sz-dev-workspaces}"; }
+
+# resolve_state_root — prints the .sz-dev root or fails
+resolve_state_root() {
+    local d reg
+    if [[ -n "${SZ_DEV_DIR:-}" ]]; then
+        printf '%s\n' "$SZ_DEV_DIR"
+        return 0
+    fi
+    d="$PWD"
+    while :; do
+        if [[ -d "$d/.sz-dev" ]]; then
+            printf '%s\n' "$d/.sz-dev"
+            return 0
+        fi
+        [[ "$d" == "/" ]] && break
+        d="$(dirname "$d")"
+    done
+    reg="$(registry_dir)/SZ${ID}"
+    if [[ -f "$reg" ]]; then
+        printf '%s/.sz-dev\n' "$(cat "$reg")"
+        return 0
+    fi
+    cat >&2 <<EOF
+ERROR: no .sz-dev/ state root found at or above $PWD,
+       and no sz-workspace registry entry for SZ${ID}.
+       Run Phase 0 first: bash "\$SKILL_DIR/tools/sz-workspace" ensure SZ${ID}, cd to the
+       printed WORKSPACE, then init there (or set SZ_DEV_DIR explicitly).
+EOF
+    exit 1
+}
+
+ROOT_DIR="$(resolve_state_root)"
+SZ_DIR="${ROOT_DIR}/SZ${ID}"
+FILE="${SZ_DIR}/progress.md"
+
+require_file() {
+    [[ -f "$FILE" ]] || {
+        echo "ERROR: no progress file at ${FILE}"
+        echo "       state root resolved as: ${ROOT_DIR}"
+        echo "       (resolution order: \$SZ_DEV_DIR -> nearest .sz-dev at/above cwd -> sz-workspace registry)"
+        echo "       If this run switched to replay mode, its state lives in the replay tree:"
+        echo "         SZ_DEV_DIR=<REPLAY_DIR>/.sz-dev $0 <subcommand> SZ${ID} ..."
+        echo "       NEVER 'init' an existing run here — it would create a fresh state tree and"
+        echo "       orphan the migrated notes. init only when Phase 0/1 never created state."
+        exit 1
+    }
+}
+
+# current <key> : value of the "key: value" line ("" if absent)
+current() {
+    grep -m1 "^$1: " "$FILE" 2>/dev/null | sed "s/^$1: //" || true
+}
+
+# set_key <key> <value> : replace the "key:" / "key: ..." line in place,
+# appending only when the key is genuinely absent (cmd_init writes
+# "awaiting:" with no trailing space, so the match must accept a bare key)
+set_key() {
+    local key="$1" value="$2"
+    if grep -Eq "^${key}:( |\$)" "$FILE" 2>/dev/null; then
+        local tmp
+        tmp="$(mktemp)"
+        awk -v k="$key" -v v="$value" '
+            $0 ~ "^" k ":( |$)" { print k ": " v; next }
+            { print }
+        ' "$FILE" > "$tmp" && mv "$tmp" "$FILE"
+    else
+        echo "${key}: ${value}" >> "$FILE"
+    fi
+}
+
+# append_note <text...> : append under the notes: section (end of file)
+append_note() {
+    local text="$*"
+    [[ -n "$text" ]] || return 0
+    printf -- "- %s\n" "$text" >> "$FILE"
+}
+
+cmd_init() {
+    mkdir -p "$SZ_DIR"
+    if [[ -f "$FILE" ]]; then
+        echo "NOTE: ${FILE} already exists, leaving it unchanged"
+        return
+    fi
+    {
+        echo "# Progress: SZ${ID}"
+        echo "phase: 0"
+        echo "mode: file"
+        echo "track: auto"
+        echo "slice: -"
+        echo "rounds: 0"
+        echo "gate1: pending"
+        echo "gate2: pending"
+        echo "gate3: pending"
+        echo "gate4: pending"
+        echo "awaiting:"
+        echo "constraints:"
+        echo "notes:"
+    } > "$FILE"
+    echo "initialized: ${FILE}"
+}
+
+cmd_show() {
+    require_file
+    echo "state root: ${ROOT_DIR}"
+    cat "$FILE"
+}
+
+# awaiting_open: non-empty when an escalation blocks the run
+awaiting_open() {
+    local a
+    a="$(current awaiting)"
+    [[ -n "$a" && "$a" != "-" ]]
+}
+
+cmd_set() {
+    require_file
+    local what="$1" which="$2" state="${3:-}" force="${4:-}"
+
+    case "$what" in
+        phase)
+            if [[ "${which^^}" == "ABORTED" ]]; then
+                local cur
+                cur="$(current phase)"
+                set_key "phase" "aborted"
+                append_note "ABORTED (was phase ${cur:-?})"
+                echo "set phase: aborted"
+                return
+            fi
+            [[ "$which" =~ ^[1-4]$ ]] || {
+                echo "ERROR: phase must be 1-4 or aborted"
+                exit 1
+            }
+            [[ -z "$force" || "$force" == "--force" ]] || usage
+            local cur
+            cur="$(current phase)"
+            if [[ "$cur" =~ ^[0-9]+$ ]] && (( cur > which )); then
+                # Backward transition: phases $which..$cur are being
+                # redone, so every gate from $which onward must be
+                # re-passed and any open escalation cleared.
+                local k
+                for k in $(seq "$which" 4); do
+                    set_key "gate${k}" "pending"
+                done
+                set_key "awaiting" ""
+                set_key "phase" "$which"
+                set_key "rounds" "0"
+                append_note "returned: phase ${cur} -> phase ${which} (gates ${which}..4 reset to pending; fix-round counter reset)"
+                echo "set phase: ${which} (returned from ${cur}; gates ${which}..4 reset to pending)"
+            elif [[ "$cur" == "aborted" ]]; then
+                set_key "phase" "$which"
+                set_key "rounds" "0"
+                append_note "resumed after abort (phase ${which}; fix-round counter reset)"
+                echo "set phase: ${which} (resumed after abort)"
+            elif [[ "$cur" =~ ^[0-9]+$ ]] && (( which > cur )) && (( which > 1 )); then
+                # Forward transition: gate(N-1) must be passed — gates are
+                # read back as fact on resume, so an impossible state must
+                # never be recorded.
+                local prevgate
+                prevgate="$(current "gate$((which - 1))")"
+                if [[ "$prevgate" != "passed" && "$force" != "--force" ]]; then
+                    echo "ERROR: phase ${which} requires gate$((which - 1)) = passed (found: ${prevgate:-pending})."
+                    echo "       Finish the previous phase, or pass --force to override (a note is recorded)."
+                    exit 1
+                fi
+                if awaiting_open && [[ "$force" != "--force" ]]; then
+                    echo "ERROR: escalation $(current awaiting) is open; answer it (or clear) before moving forward."
+                    echo "       Pass --force to override (a note is recorded)."
+                    exit 1
+                fi
+                set_key "phase" "$which"
+                set_key "rounds" "0"
+                if [[ "$force" == "--force" ]]; then
+                    append_note "phase ${cur} -> phase ${which} with --force (gate$((which - 1)) was ${prevgate:-pending}; awaiting: $(current awaiting); fix-round counter reset)"
+                    echo "set phase: ${which} (--force; note recorded)"
+                else
+                    echo "set phase: ${which} (fix-round counter reset)"
+                fi
+            else
+                set_key "phase" "$which"
+                echo "set phase: ${which}"
+            fi
+            ;;
+        gate)
+            [[ "$which" =~ ^[1-4]$ ]] || {
+                echo "ERROR: gate must be 1-4"
+                exit 1
+            }
+            [[ "$state" == "pending" || "$state" == "passed" || "$state" == "rejected" ]] || {
+                echo "ERROR: state must be pending|passed|rejected"
+                exit 1
+            }
+            [[ -z "$force" || "$force" == "--force" ]] || usage
+            if [[ "$state" == "passed" ]]; then
+                local cur k prevgate
+                cur="$(current phase)"
+                if ! [[ "$cur" =~ ^[0-9]+$ ]] || (( cur < which )); then
+                    echo "ERROR: gate ${which} cannot pass while phase is ${cur:-0} (< ${which})."
+                    echo "       Set phase ${which} first."
+                    exit 1
+                fi
+                if [[ "$force" != "--force" ]]; then
+                    for k in $(seq 1 $((which - 1))); do
+                        prevgate="$(current "gate${k}")"
+                        if [[ "$prevgate" != "passed" ]]; then
+                            echo "ERROR: gate ${which} cannot pass while gate${k} is ${prevgate:-pending} (no skipping)."
+                            exit 1
+                        fi
+                    done
+                    # evidence before milestone: the gate's packet must exist
+                    case "$which" in
+                        2)
+                            if ! ls "${SZ_DIR}"/phase2-plan*.md >/dev/null 2>&1; then
+                                echo "ERROR: gate 2 passed requires the implementation plan on disk:"
+                                echo "       phase2-plan.md (or phase2-plan-<slice>.md)."
+                                exit 1
+                            fi
+                            if [[ ! -f "${SZ_DIR}/phase2-review.md" ]]; then
+                                echo "ERROR: gate 2 passed requires phase2-review.md on disk"
+                                echo "       (self- + independent review findings)."
+                                exit 1
+                            fi
+                            ;;
+                        1)
+                            if [[ ! -f "${SZ_DIR}/phase1-requirement.md" ]] \
+                               || ! grep -qiE "^[[:space:]]*([-*+>][[:space:]]*)?[*_~]*[[:space:]]*repro: *[*_~]*(red|n/a|manual)\b" "${SZ_DIR}/phase1-requirement.md"; then
+                                echo "ERROR: gate 1 passed requires phase1-requirement.md with the repro conclusion"
+                                echo "       (repro red / repro: n/a / repro: manual) — write it first."
+                                exit 1
+                            fi
+                            if [[ ! -f "${SZ_DIR}/attachment/ticket-body.md" \
+                               || ! -f "${SZ_DIR}/attachment/ticket-comments.md" ]]; then
+                                echo "ERROR: gate 1 passed requires the raw requirement sources on disk:"
+                                echo "       attachment/ticket-body.md + attachment/ticket-comments.md"
+                                echo "       (verbatim bug_info + bug_comments; Phase 2's review reads them)."
+                                exit 1
+                            fi
+                            # anchored to a conclusion line (start of line, optional
+                            # list/quote marker): prose or comments mentioning the
+                            # token mid-sentence must not read as the conclusion
+                            # (observed: an explanatory "(... required only for
+                            # repro: red.)" note tripped the unanchored grep).
+                            # Same anchor on the driver-data check: quoting the
+                            # rule's option list in prose must not count as the
+                            # provenance statement.
+                            if grep -qiE "^[[:space:]]*([-*+>][[:space:]]*)?repro: *red\b" "${SZ_DIR}/phase1-requirement.md" \
+                               && ! grep -qiE "^[[:space:]]*([-*+>][[:space:]]*)?driver data: *(ticket-verbatim|fixture +[^ ]+|hand-built \+ mapping)\b" "${SZ_DIR}/phase1-requirement.md"; then
+                                echo "ERROR: an executed repro (repro: red) requires a driver-data provenance statement:"
+                                echo "       'driver data: ticket-verbatim' | 'driver data: fixture <path>'"
+                                echo "       | 'driver data: hand-built + mapping' (with a code-var -> index ->"
+                                echo "       ticket-element table cross-checked against a prior-art diff)."
+                                exit 1
+                            fi
+                            ;;
+                        3)
+                            if [[ ! -f "${SZ_DIR}/phase3-test-plan.md" || ! -f "${SZ_DIR}/phase3-test-report.md" ]]; then
+                                echo "ERROR: gate 3 passed requires phase3-test-plan.md and phase3-test-report.md on disk."
+                                exit 1
+                            fi
+                            ;;
+                        4)
+                            if [[ ! -f "${SZ_DIR}/deliverables/CHANGES-SZ${ID}.patch" ]]; then
+                                echo "ERROR: gate 4 passed requires deliverables/CHANGES-SZ${ID}.patch"
+                                echo "       (the full code diff — the primary human-audit artifact)."
+                                exit 1
+                            fi
+                            if [[ ! -s "${SZ_DIR}/phase4-handoff.md" ]]; then
+                                echo "ERROR: gate 4 passed requires a non-empty phase4-handoff.md on disk."
+                                exit 1
+                            fi
+                            if ! ls "${SZ_DIR}"/deliverables/RN*.md >/dev/null 2>&1 \
+                               || ! ls "${SZ_DIR}"/deliverables/TC*.md >/dev/null 2>&1; then
+                                echo "ERROR: gate 4 passed requires RN-*.md and TC-*.md under deliverables/."
+                                exit 1
+                            fi
+                            local pkg
+                            pkg="$(current package)"
+                            if [[ -z "$pkg" ]]; then
+                                echo "ERROR: gate 4 passed requires the delivery package recorded first:"
+                                echo "       bash \"\$SKILL_DIR/tools/sz-progress\" set SZ${ID} meta package <abs path>"
+                                echo "       (Phase 4 Step 3.5 records the ~/sz/ tarball; the file must exist)."
+                                exit 1
+                            fi
+                            if [[ ! -f "$pkg" ]]; then
+                                echo "ERROR: the recorded package no longer exists: $pkg"
+                                echo "       Rebuild per Phase 4 Step 3.5 and re-record with 'set meta package'."
+                                exit 1
+                            fi
+                            ;;
+                    esac
+                    if awaiting_open; then
+                        echo "ERROR: escalation $(current awaiting) is open; answer it (or clear) before passing a gate."
+                        echo "       Pass --force to override (a note is recorded)."
+                        exit 1
+                    fi
+                fi
+            fi
+            set_key "gate${which}" "$state"
+            if [[ "$state" == "rejected" ]]; then
+                append_note "gate ${which} rejected by human"
+            elif [[ "$state" == "passed" && "$force" == "--force" ]]; then
+                append_note "gate ${which} passed with --force (invariant checks overridden)"
+            fi
+            echo "set gate${which}: ${state}"
+            ;;
+        meta)
+            local key="$2" value="$3"
+            case "$key" in
+                mode)   [[ "$value" == "file" || "$value" == "orchestrated" ]] || { echo "ERROR: mode is file|orchestrated"; exit 1; } ;;
+                track)  [[ "$value" == "auto" || "$value" == "manual" ]] || { echo "ERROR: track is auto|manual"; exit 1; } ;;
+                slice)  [[ "$value" =~ ^[0-9]+/[0-9]+$ || "$value" == "-" ]] || { echo "ERROR: slice is <n>/<m> or -"; exit 1; } ;;
+                base)
+                    [[ "$value" =~ ^[0-9a-fA-F]{7,40}$ ]] || {
+                        echo "ERROR: base is a git sha (git rev-parse HEAD), got: $value"
+                        exit 1
+                    }
+                    value="${value,,}"
+                    local prevbase
+                    prevbase="$(current base)"
+                    if [[ -n "$prevbase" && "$prevbase" != "$value" ]]; then
+                        append_note "base changed: ${prevbase} -> ${value}"
+                        echo "WARNING: base was ${prevbase}, now ${value} (note recorded — verify-tree will anchor on the new sha)"
+                    fi
+                    ;;
+                package)
+                    [[ -f "$value" ]] || {
+                        echo "ERROR: package path does not exist: $value"
+                        echo "       Build the delivery tarball first (Phase 4 Step 3.5), then record it."
+                        exit 1
+                    }
+                    ;;
+                *)      usage ;;
+            esac
+            set_key "$key" "$value"
+            echo "set ${key}: ${value}"
+            ;;
+        *)
+            usage
+            ;;
+    esac
+}
+
+cmd_awaiting() {
+    require_file
+    local what="$1"
+    [[ -n "$what" ]] || usage
+    if [[ "${what,,}" == "clear" ]]; then
+        set_key "awaiting" ""
+        append_note "escalation answered; awaiting cleared"
+        echo "awaiting: cleared"
+    else
+        [[ "$what" =~ ^E[1-7]$ ]] || {
+            echo "ERROR: awaiting takes E1-E7 or clear (found: $what)"
+            exit 1
+        }
+        set_key "awaiting" "$what"
+        append_note "escalation open: ${what} (blocks the current phase; resume re-presents it)"
+        echo "awaiting: ${what}"
+    fi
+}
+
+cmd_bump() {
+    require_file
+    local n
+    n="$(current rounds)"
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    set_key "rounds" "$((n + 1))"
+    append_note "fix round $((n + 1))"
+    echo "rounds: $((n + 1))"
+}
+
+cmd_constraint() {
+    require_file
+    local text="$*"
+    [[ -n "$text" ]] || {
+        echo "ERROR: constraint text required"
+        exit 1
+    }
+    local tmp
+    tmp="$(mktemp)"
+    awk -v t="  - ${text}" '
+        /^constraints:$/ { print; print t; done = 1; next }
+        /^notes:$/ && !done { print "constraints:"; print t; done = 1 }
+        { print }
+        END { if (!done) { print "constraints:"; print t } }
+    ' "$FILE" > "$tmp" && mv "$tmp" "$FILE"
+    echo "constraint recorded"
+}
+
+cmd_note() {
+    require_file
+    local text="$*"
+    [[ -n "$text" ]] || {
+        echo "ERROR: note text required"
+        exit 1
+    }
+    append_note "$text"
+    echo "noted"
+}
+
+case "$CMD" in
+    init)
+        [[ $# -eq 2 ]] || usage
+        cmd_init
+        ;;
+    show)
+        [[ $# -eq 2 ]] || usage
+        cmd_show
+        ;;
+    set)
+        # set <SZ> phase <n|aborted> [--force]        (4-5 args)
+        # set <SZ> gate <n> <st> [--force]            (5-6 args)
+        # set <SZ> meta <mode|track|slice> <value>    (5 args)
+        case "$3" in
+            phase)
+                if [[ $# -eq 5 && "${5:-}" == "--force" ]]; then
+                    cmd_set phase "$4" "" "--force"
+                elif [[ $# -eq 4 ]]; then
+                    cmd_set phase "$4" "" ""
+                else
+                    usage
+                fi
+                ;;
+            gate)
+                if [[ $# -eq 6 && "${6:-}" == "--force" ]]; then
+                    cmd_set gate "$4" "$5" "--force"
+                elif [[ $# -eq 5 ]]; then
+                    cmd_set gate "$4" "$5" ""
+                else
+                    usage
+                fi
+                ;;
+            meta)
+                [[ $# -eq 5 ]] || usage
+                cmd_set meta "$4" "$5" ""
+                ;;
+            *)
+                usage
+                ;;
+        esac
+        ;;
+    awaiting)
+        [[ $# -eq 3 ]] || usage
+        cmd_awaiting "$3"
+        ;;
+    bump)
+        [[ $# -eq 2 ]] || usage
+        cmd_bump
+        ;;
+    constraint)
+        [[ $# -ge 3 ]] || usage
+        cmd_constraint "${@:3}"
+        ;;
+    note)
+        [[ $# -ge 3 ]] || usage
+        cmd_note "${@:3}"
+        ;;
+    *)
+        usage
+        ;;
+esac

@@ -1,0 +1,21 @@
+# ai-flow build artifacts
+ai-flow/dist/
+ai-flow/.vite/
+ai-flow/node_modules/
+ai-flow/*.tsbuildinfo
+
+# npm
+node_modules/
+
+# ai-flow runtime state (per-run records; never commit)
+.ai-flow/
+.sz-dev/
+ai-flow/.ai-flow/
+
+# secrets / local config
+ai-flow.config.json
+.env
+
+# OS
+Thumbs.db
+.DS_Store

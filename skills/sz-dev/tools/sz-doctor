@@ -1,0 +1,617 @@
+#!/usr/bin/env python3
+"""sz-doctor — one-shot health check for the sz-dev framework.
+
+Checks (each prints PASS/FAIL; any FAIL exits 1):
+  1. tools smoke        sz-progress / sz-workspace usage exits, sz-gen-deliverable
+                        renders all four skeletons, sz-preflight resolves its
+                        skill dir on a relative invocation
+  2. pack check tool    references/cql/tools/cql_lint.py --all exits 0
+  3. accept self-test   cql/test/acceptance/selftest.py exits 0
+                        (SKIP, not FAIL, when host/PyYAML missing)
+  4. pack tables        every references/*/README.md declares all 7 capabilities
+                        and the file paths it references exist
+  5. tools selftest     tools/selftest passes (synthetic-env behavior
+                        regression for cql-run / sz-replay / sz-preflight /
+                        sz-verify-tree)
+  6. refs               every sz-dev markdown's file references resolve (against
+                        the file's dir, its skill root, the repo root, or a
+                        repo-wide path suffix); bare filenames are not
+                        checkable and are skipped, and refs the doc itself
+                        marks "(pending)" are counted, not failed. Runtime
+                        state paths (attachment/..., anything under
+                        .sz-dev/) and per-SZ case YAMLs documented as
+                        delivered outside the repo (cases/...) are
+                        recognized and skipped. The pack-driven docs
+                        outside skills/sz-dev/ (cql/test/acceptance/*.md)
+                        are scanned too.
+  7. contract           contracts.md's declared capability set agrees with the
+                        code constant and SKILL.md, and no doc invokes a
+                        capability outside that set
+  8. framework leak     SKILL.md / contracts.md / workflows/*.md name no
+                        pack-internal file paths (only a pack's entry-point
+                        README) — capability commands/paths belong to the
+                        pack, and framework-embedded copies go stale
+  9. hygiene            no banned tokens (cql-dev, ccisearch, search_similar_sz,
+                        add_comment, fetch_gitlab_content),
+                        no File.ext:NNN line references, no CJK text in
+                        skills/sz-dev/ or cql/test/acceptance/*.py
+                        (the SKILL.md frontmatter description line is
+                        exempt — it carries the Chinese trigger phrases)
+ 10. skill copies       the installed copy (SZ_SKILL_INSTALL_DIR, default
+                        ~/.zcode/skills/sz-dev) matches the repository copy
+                        (SKIP when no installed copy exists)
+ 11. frontmatter        sz-dev SKILL.md description is trigger-focused
+                        (<= 900 chars; the cap accommodates the longest
+                        existing skill description, not a strict 600)
+ 12. skill size         SKILL.md within the 550-line guardrail
+ 13. tools documented   every script under tools/ is named in SKILL.md and
+                        README.md (an undocumented tool is never run)
+ 14. state keys         every progress.md key the phase machine reads is
+                        written by some workflow file (otherwise the branch
+                        it drives can never fire)
+ 15. arch cache         every pack architecture-cache.md carries a parseable
+                        validity window and is within it
+ 16. user clone config  ~/.config/sz-dev/config present + not group/other
+                        readable (missing = PASS with a setup hint pointing
+                        at `sz-workspace config`; loose perms = FAIL)
+"""
+
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+CAPABILITIES = ("check", "repro", "routing", "accept", "build",
+                "deliverables", "review-checklist")
+BANNED_TOKENS = ("cql-dev", "ccisearch", "search_similar_sz")
+# red-line tool names: mentioning them is fine when the mention forbids
+# their use (SKILL.md hard rules); any other mention means the docs
+# drift into teaching the agent to write to the ticket system
+RED_LINE_TOOLS = ("add_comment", "fetch_gitlab_content")
+RED_LINE_OK = re.compile(
+    r"forbidden|never|\bnot\b|\bno\b|read.only|without", re.I)
+LINE_REF = re.compile(r"[A-Za-z0-9_\-./]+\.(?:py|md|scm|sh|ya?ml|scc|c|h):[0-9]+")
+CJK = re.compile(r"[\u4e00-\u9fff\u3400-\u4dbf]")
+
+# --- checks 8-10 (logical consistency) -------------------------------------
+# A reference token is checked only when it is unambiguously a path: it has a
+# `/`, ends with a known artifact extension, and carries no shell / URL /
+# placeholder syntax. Bare filenames never qualify — a guide may legitimately
+# name a file that lives in a module tree it does not link, and flagging those
+# is pure noise.
+REF_EXTS = (".md", ".py", ".sh", ".scm", ".scc", ".yaml", ".yml", ".json")
+SKIP_DIRS = {".git", "node_modules", "__pycache__", "playwright-report",
+             "test-results", ".venv", "dist", "build"}
+# Tokens that read like paths but are not repo paths, so static resolution
+# cannot tell them from a real mistake. Every entry carries its reason, so the
+# list stays auditable and cannot quietly hide a defect.
+REF_ALLOW = {
+    "references/cql/tools/szxxxxx-repro.scm":
+        "replay-mode.md 'e.g.' example of an SZ-named pack file "
+        "(generic placeholder, not a real file)",
+    "Merge/ShrinkReceivedUnits.sh":
+        "step label 'Merge' joined to the script name; the script is "
+        "cql/scripts/ShrinkReceivedUnits.sh",
+}
+# A reference the document itself marks `(pending)` is a declared gap (a
+# workflow doc not written yet), not a defect: skip it, but count it so the
+# report stays transparent.
+PENDING_MARK = re.compile(r"\(pending\)", re.I)
+_INDEX = None  # basename -> [repo-relative path]s, built on first use
+
+results: list[tuple[bool, str]] = []
+
+
+def record(ok: bool, msg: str) -> None:
+    results.append((ok, msg))
+    print(("PASS  " if ok else "FAIL  ") + msg)
+
+
+def run(cmd: list[str], **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+
+def find_repo_root() -> Path:
+    try:
+        top = run(["git", "-C", str(SCRIPT_DIR), "rev-parse", "--show-toplevel"])
+        if top.returncode == 0 and top.stdout.strip():
+            return Path(top.stdout.strip())
+    except OSError:
+        pass
+    for p in SCRIPT_DIR.parents:
+        if (p / ".git").exists():
+            return p
+    # installed skill copies live outside any git repo (~/.zcode/skills);
+    # fall back to the invoking cwd so the health check still targets
+    # the workspace checkout the operator is standing in
+    for p in [Path.cwd(), *Path.cwd().parents]:
+        if (p / ".git").exists():
+            return p
+    sys.exit("sz-doctor: cannot locate the repository root")
+
+
+REPO = find_repo_root()
+SKILL = REPO / "skills" / "sz-dev"
+
+
+def check_tools_smoke() -> None:
+    ok = True
+    for tool in ("sz-progress", "sz-workspace"):
+        p = run(["bash", str(SKILL / "tools" / tool)])
+        if p.returncode != 2:
+            ok = False
+            record(False, f"tools smoke: {tool} no-args exit {p.returncode} (want 2)")
+    for kind in ("rn", "tc", "cn", "in", "phase1", "plan", "review",
+                 "testplan", "report"):
+        with tempfile.TemporaryDirectory() as td:
+            out = run(["bash", str(SKILL / "tools" / "sz-gen-deliverable"),
+                       kind, "SZ000000", "doctor"])
+            good = out.returncode == 0 and len(out.stdout) > 100
+            if not good:
+                ok = False
+                record(False, f"tools smoke: sz-gen-deliverable {kind} failed")
+    if ok:
+        record(True, "tools smoke: sz-progress / sz-workspace usage exits, "
+                     "sz-gen-deliverable renders rn/tc/cn/in")
+    # sz-preflight must locate the skill dir on a relative invocation with
+    # CDPATH armed — the exact shape that once false-FAILed every tool check
+    pf = run(["bash", "tools/sz-preflight"], cwd=str(SKILL))
+    pf_bad = ("missing from skill dir" in pf.stdout
+              or "PASS  tools/sz-progress" not in pf.stdout)
+    record(not pf_bad, "tools smoke: sz-preflight resolves its skill dir "
+           "(relative invocation, CDPATH-bearing shell)"
+           + ("" if not pf_bad else " — output: " + pf.stdout[:200]))
+
+
+def check_lint() -> None:
+    p = run(["python3", str(SKILL / "references/cql/tools/cql_lint.py"), "--all"])
+    record(p.returncode == 0,
+           f"pack check tool: cql_lint.py --all exit {p.returncode} (want 0)")
+
+
+def check_selftest() -> None:
+    # environment prerequisites are a SKIP, not a FAIL (they say nothing
+    # about framework health): Linux test host + PyYAML
+    if not sys.platform.startswith("linux"):
+        record(True, "accept self-test: SKIP (not a Linux host)")
+        return
+    p = run(["python3", "-c", "import yaml"])
+    if p.returncode != 0:
+        record(True, "accept self-test: SKIP (PyYAML not installed)")
+        return
+    p = run(["python3", str(REPO / "cql/test/acceptance" / "selftest.py")])
+    record(p.returncode == 0,
+           f"accept self-test: cql/test/acceptance/selftest.py exit {p.returncode} (want 0)")
+
+
+def check_tools_selftest() -> None:
+    """Behavior-level regression for the framework tools (cql-run, sz-replay:
+    diff/verify/audit/exclusions/finish). Synthetic env — no engine, no DB."""
+    if not (SKILL / "tools/selftest").exists():
+        record(True, "tools selftest: SKIP (no tools/selftest yet)")
+        return
+    p = run(["bash", str(SKILL / "tools/selftest")])
+    tail = "; ".join(p.stdout.strip().splitlines()[-3:])
+    record(p.returncode == 0,
+           f"tools selftest: {tail}")
+
+
+def check_pack_tables() -> None:
+    ok = True
+    # iterate directories, not READMEs: a pack dir without README.md
+    # must fail the contract (contracts.md "Adding a new module"),
+    # not silently escape the check
+    for pack in sorted(p for p in (SKILL / "references").iterdir() if p.is_dir()):
+        readme = pack / "README.md"
+        if not readme.exists():
+            ok = False
+            record(False, f"pack {pack.name}: README.md missing")
+            continue
+        text = readme.read_text(encoding="utf-8")
+        # capability cell is either `name` (claim shape) or **name** (cql shape)
+        missing = [c for c in CAPABILITIES
+                   if not re.search(rf"^\|\s*(?:\*\*|`)?{re.escape(c)}(?:\*\*|`)?\s*[—|]",
+                                    text, re.M)]
+        if missing:
+            ok = False
+            record(False, f"pack table {pack.name}: missing capabilities "
+                          f"{', '.join(missing)}")
+        # rows that look like capability rows (bold or backticked first
+        # cell — both table shapes) but are outside the contract: an
+        # undeclared row erodes the contract's meaning, so flag it
+        extra = sorted(set(re.findall(
+            r"^\|\s*(?:\*\*|`)?([a-z][a-z-]+)(?:\*\*|`)?\s*[—|]",
+            text, re.M)) - set(CAPABILITIES))
+        if extra:
+            ok = False
+            record(False, f"pack table {pack.name}: rows outside the "
+                          f"capability contract: {', '.join(extra)}")
+        for tok in set(re.findall(r"`([^`\n]+)`", text)):
+            # only slash-paths are checkable references; bare names
+            # (cql.hlp, cci.c, ...) are loose mentions, skip them
+            if "/" not in tok or " " in tok or tok.startswith("SZ") or "$" in tok:
+                continue
+            bases = (pack, pack / "templates", SKILL, REPO)
+            if not any((b / tok).exists() for b in bases):
+                ok = False
+                record(False, f"pack table {pack.name}: referenced path missing: {tok}")
+    if ok:
+        record(True, "pack tables: all packs declare exactly the 7 contract "
+                     "capabilities; referenced paths exist")
+
+
+def repo_index():
+    """basename -> repo-relative paths, so a token can be resolved by path
+    suffix without walking the tree once per token."""
+    global _INDEX
+    if _INDEX is None:
+        import os
+        idx: dict[str, list[str]] = {}
+        for dirpath, dirnames, filenames in os.walk(REPO):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            rel = Path(dirpath).relative_to(REPO)
+            base = "" if rel.as_posix() == "." else rel.as_posix() + "/"
+            for name in filenames:
+                idx.setdefault(name, []).append(base + name)
+        _INDEX = idx
+    return _INDEX
+
+
+def ref_token(raw: str):
+    """The checkable path inside `raw`, else None."""
+    tok = raw.strip().rstrip("/").split("#", 1)[0]
+    if not tok or "/" not in tok:
+        return None
+    if tok.startswith(("~", "/", ".")) or "://" in tok or "$" in tok:
+        return None
+    if any(c in tok for c in " \t*<>()[]{}|"):
+        return None
+    if "..." in tok or "::" in tok or tok.startswith("SZ"):
+        return None
+    # runtime state under the run's .sz-dev/ tree (the attachment cache)
+    # and per-SZ case YAMLs documented as delivered outside the repo
+    # (routing.md "delivered outside the repo"): never repo-relative
+    # paths, so static resolution cannot and must not judge them
+    if tok.startswith(("attachment/", "cases/")) or ".sz-dev/" in tok:
+        return None
+    if tok in REF_ALLOW or not tok.endswith(REF_EXTS):
+        return None
+    return tok
+
+
+def iter_refs(text: str):
+    """Yield (token, is_pending) for every reference-looking span, scanning
+    line by line so a `(pending)` marker applies to the refs on its own line."""
+    for line in text.splitlines():
+        pending = bool(PENDING_MARK.search(line))
+        for raw in re.findall(r"`([^`\n]+)`", line):
+            yield raw, pending
+        for raw in re.findall(r"\]\(([^)\n]+)\)", line):
+            yield raw, pending
+
+
+def unresolved_refs(text: str, base: Path):
+    """(unresolved refs, count of pending refs skipped) for one document."""
+    bad: list[str] = []
+    pending = 0
+    seen: set[str] = set()
+    for raw, is_pending in iter_refs(text):
+        tok = ref_token(raw)
+        if not tok or tok in seen:
+            continue
+        seen.add(tok)
+        if is_pending:
+            pending += 1
+        elif not refs_resolve(tok, base):
+            bad.append(tok)
+    return bad, pending
+
+
+def refs_resolve(tok: str, base: Path) -> bool:
+    # the skill root differs between the `skills/<skill>/` and
+    # `skills/<group>/<skill>/` layouts: take the nearest ancestor that holds
+    # a SKILL.md, and let the repo-wide suffix match absorb the rest
+    skill_root = None
+    for anc in base.parents:
+        if (anc / "SKILL.md").exists():
+            skill_root = anc
+            break
+        if anc == REPO:
+            break
+    for cand in (base / tok, REPO / tok) + ((skill_root / tok,) if skill_root else ()):
+        if cand.exists():
+            return True
+    name = tok.rsplit("/", 1)[-1]
+    return any(p == tok or p.endswith("/" + tok)
+               for p in repo_index().get(name, ()))
+
+
+def _ref_report(ok: bool, label: str, bad: list[str]) -> None:
+    record(ok, label + ("" if not bad else " — " + "; ".join(bad[:8])
+                        + (f" (+{len(bad) - 8} more)" if len(bad) > 8 else "")))
+
+
+def check_refs() -> None:
+    bad: list[str] = []
+    pending = 0
+    files = sorted(SKILL.rglob("*.md"))
+    # the packs also drive assets outside skills/sz-dev/: a stale path in
+    # those docs breaks a run just the same, so lint them too
+    files += sorted((REPO / "cql" / "test" / "acceptance").glob("*.md"))
+    for f in files:
+        text = f.read_text(encoding="utf-8", errors="ignore")
+        broken, pend = unresolved_refs(text, f.parent)
+        rel = f.relative_to(REPO).as_posix()
+        bad += [f"{rel}: {tok}" for tok in broken]
+        pending += pend
+    _ref_report(not bad, f"refs: sz-dev references resolve "
+                         f"({pending} pending references skipped)", bad)
+
+
+def check_contracts() -> None:
+    declared = set(re.findall(
+        r"^\|\s*`([a-z][a-z-]*)`\s*\|",
+        (SKILL / "contracts.md").read_text(encoding="utf-8"), re.M))
+    if declared != set(CAPABILITIES):
+        record(False, f"contract: contracts.md declares {sorted(declared)} but "
+                      f"the code constant is {sorted(CAPABILITIES)}")
+        return
+    skill_md = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    absent = sorted(c for c in declared if f"`{c}`" not in skill_md)
+    if absent:
+        record(False, f"contract: SKILL.md never names capabilities {absent}")
+        return
+    # a capability name invoked in prose ("pack `check` capability") must be
+    # one the contract declares; the word "capability" is the anchor
+    invoked: dict[str, str] = {}
+    for f in sorted(SKILL.rglob("*.md")):
+        t = f.read_text(encoding="utf-8", errors="ignore")
+        names = set(re.findall(r"`([a-z][a-z-]*)`\s+capabilit", t))
+        names |= set(re.findall(r"capabilit\w*[^.\n]{0,30}?`([a-z][a-z-]*)`", t))
+        for n in names - declared:
+            invoked.setdefault(n, f.relative_to(REPO).as_posix())
+    if invoked:
+        record(False, "contract: undeclared capability invoked: "
+                      + "; ".join(f"{n} ({p})" for n, p in sorted(invoked.items())))
+        return
+    record(True, f"contract: {len(declared)} capabilities agree across "
+                 "contracts.md / code / SKILL.md; no undeclared invocation")
+
+
+def check_framework_leak() -> None:
+    """Framework files stay module-agnostic: they may name a pack's entry
+    point (references/<module>/README.md) or the pack dir itself, but no
+    deeper pack-internal file. Capability commands / exit codes / file
+    paths belong to the pack (contracts.md); a framework-embedded copy
+    goes stale the moment the pack moves (that drift already happened
+    once with the CQL runner text)."""
+    bad = []
+    files = sorted(SKILL.glob("*.md")) + sorted((SKILL / "workflows").glob("*.md"))
+    for f in files:
+        text = f.read_text(encoding="utf-8", errors="ignore")
+        for m in re.finditer(
+                r"references/[a-z0-9_-]+(?:/[A-Za-z0-9_.-]+)+", text):
+            tok = m.group(0)
+            mod = tok.split("/")[1]
+            if tok == f"references/{mod}/README.md":
+                continue
+            if tok in REF_ALLOW or ".sz-dev" in tok:
+                continue
+            bad.append(f"{f.relative_to(SKILL).as_posix()}: {tok}")
+    record(not bad, "framework leak: SKILL/contracts/workflows name no "
+           "pack-internal paths"
+           + ("" if not bad else " — " + "; ".join(bad[:8])
+              + (f" (+{len(bad) - 8} more)" if len(bad) > 8 else "")))
+
+
+def check_hygiene() -> None:
+    bad: list[str] = []
+    targets = [p for p in SKILL.rglob("*")
+               if p.is_file() and p.name != "sz-doctor"
+               and "__pycache__" not in p.parts]
+    targets += [p for p in (REPO / "cql/test/acceptance").glob("*.py")]
+    for p in targets:
+        try:
+            text = p.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        rel = p.relative_to(REPO).as_posix()
+        # the SKILL.md frontmatter description carries the Chinese trigger
+        # phrases (routing for Chinese-language operators); every other
+        # file — and every other line of SKILL.md — stays English-only
+        cjk_text = re.sub(r"^description: .*$", "", text, count=1, flags=re.M) \
+            if p.name == "SKILL.md" else text
+        for tok in BANNED_TOKENS:
+            if tok in text:
+                bad.append(f"{rel}: banned token '{tok}'")
+        lines = text.splitlines()
+        for tok in RED_LINE_TOOLS:
+            for i, line in enumerate(lines):
+                if tok not in line:
+                    continue
+                ctx = "\n".join(lines[max(0, i - 2):i + 3])
+                if not RED_LINE_OK.search(ctx):
+                    bad.append(f"{rel}:{i + 1}: red-line tool '{tok}' "
+                               "mentioned without a prohibition")
+        m = LINE_REF.search(text)
+        if m:
+            bad.append(f"{rel}: line-number reference '{m.group(0)}'")
+        if CJK.search(cjk_text):
+            bad.append(f"{rel}: CJK text")
+    record(not bad, "hygiene: banned tokens / line refs / CJK"
+           + ("" if not bad else " — " + "; ".join(bad[:8])
+              + (f" (+{len(bad) - 8} more)" if len(bad) > 8 else "")))
+
+
+def check_drift() -> None:
+    import os
+    # install location is deployment-specific; unset => not managed here
+    installed_s = os.environ.get("SZ_SKILL_INSTALL_DIR",
+                                 str(Path.home() / ".zcode" / "skills" / "sz-dev"))
+    if not os.environ.get("SZ_SKILL_INSTALL_DIR") and not Path(installed_s).is_dir():
+        record(True, "skill copies: SKIP (no installed copy; set SZ_SKILL_INSTALL_DIR "
+                     f"to check one, e.g. {installed_s})")
+        return
+    installed = Path(installed_s)
+    if not installed.is_dir():
+        record(False, f"skill copies: installed copy missing at {installed} "
+                      f"(sync: rsync -a --delete --exclude __pycache__ "
+                      f"{SKILL}/ {installed}/)")
+        return
+    p = run(["diff", "-rq", "-x", "__pycache__", str(SKILL), str(installed)])
+    if p.returncode == 0:
+        record(True, "skill copies: installed copy matches the repository")
+    else:
+        brief = "; ".join(p.stdout.strip().splitlines()[:5])
+        record(False, f"skill copies: drift — {brief} "
+                      f"(sync: rsync -a --delete --exclude __pycache__ "
+                      f"{SKILL}/ {installed}/)")
+
+
+def check_description() -> None:
+    # 900, not 600: the cap accommodates the longest existing skill
+    # description (cci-system/cql, 865) so the check flags runaway growth
+    # instead of forcing a rewrite of already-working triggers
+    text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
+    m = re.search(r"^description: (.*)$", text, re.M)
+    n = len(m.group(1)) if m else -1
+    record(0 <= n <= 900,
+           f"frontmatter: SKILL.md description {n} chars (limit 900)")
+
+
+def check_skill_size() -> None:
+    # 550 vs the current ~390: headroom for ordinary growth, but a hard
+    # stop before SKILL.md re-accumulates what workflows/ and the packs
+    # own (README.md "Maintainer rules" — consolidate before adding).
+    # Workflows get their own caps: procedural docs past ~300 lines stop
+    # being read whole — steps drown in prose, so detail must live in
+    # skeletons (sz-gen-deliverable), packs, or mode files instead.
+    n = len((SKILL / "SKILL.md").read_text(encoding="utf-8").splitlines())
+    ok = n <= 550
+    msg = f"skill size: SKILL.md {n} lines (guardrail 550)"
+    for wf in sorted((SKILL / "workflows").glob("*.md")):
+        w = len(wf.read_text(encoding="utf-8").splitlines())
+        if w > 300:
+            ok = False
+            msg += f"; {wf.name} {w} lines OVER the 300 workflow cap"
+        else:
+            msg += f"; {wf.name} {w}"
+    record(ok, msg + " — consolidate before adding")
+
+
+def check_tools_documented() -> None:
+    """Every script shipped under tools/ must be named in SKILL.md and
+    README.md — a tool nobody documents is a tool nobody runs."""
+    texts = {"SKILL.md": (SKILL / "SKILL.md").read_text(encoding="utf-8"),
+             "README.md": (SKILL / "README.md").read_text(encoding="utf-8")}
+    missing = []
+    for p in sorted((SKILL / "tools").iterdir()):
+        if not p.is_file() or p.name == "__pycache__":
+            continue
+        for label, text in texts.items():
+            if p.name not in text:
+                missing.append(f"{p.name} ({label})")
+    record(not missing, "tools documented: every tools/ script named in "
+           "SKILL.md + README.md"
+           + ("" if not missing else " — missing " + ", ".join(missing)))
+
+
+# progress.md key -> the sz-progress invocation that writes it
+STATE_KEY_CMDS = {
+    "phase": r"\bphase\s+[1-4]",
+    "gate": r"\bgate\s+[1-4]",
+    "mode": r"meta\s+mode",
+    "track": r"meta\s+track",
+    "slice": r"meta\s+slice",
+    "base": r"meta\s+base",
+    "package": r"meta\s+package",
+    "rounds": r"\bbump\b",
+    "awaiting": r"\bawaiting\b",
+    "constraints": r"\bconstraint\b",
+}
+
+
+def check_state_keys() -> None:
+    """A progress.md key the phase machine reads must be written by some
+    workflow file, else the branch it drives can never fire (a documented
+    key that no step ever sets is dead state)."""
+    text = "\n".join(f.read_text(encoding="utf-8", errors="ignore")
+                     for f in sorted(SKILL.glob("workflows/*.md")))
+    missing = [k for k, pat in STATE_KEY_CMDS.items()
+               if not re.search(pat, text)]
+    record(not missing, "state keys: every progress.md key is written by a "
+           "workflow"
+           + ("" if not missing else " — never written: " + ", ".join(missing)))
+
+
+def check_arch_cache() -> None:
+    """Every pack architecture-cache must carry a parseable validity window
+    and be within it — a stale cache is worse than none (facts drift while
+    confidence stays). Refresh = a run re-verifying the facts and bumping
+    cache-date/valid-until (contracts.md rule 8)."""
+    import datetime
+    caches = sorted(SKILL.glob("references/*/domain/architecture-cache.md"))
+    if not caches:
+        record(True, "arch cache: no pack carries architecture-cache.md yet")
+        return
+    today = datetime.date.today()
+    bad = []
+    for c in caches:
+        text = c.read_text(encoding="utf-8", errors="ignore")
+        m = re.search(r"^valid-until:\s*(\d{4}-\d{2}-\d{2})\s*$", text, re.M)
+        rel = c.relative_to(SKILL).as_posix()
+        if not m:
+            bad.append(f"{rel}: no valid-until line")
+        elif datetime.date.fromisoformat(m.group(1)) < today:
+            bad.append(f"{rel}: expired {m.group(1)} — refresh by re-verifying "
+                       "the facts on a run and bumping the dates")
+    record(not bad, "arch cache: fresh within validity window"
+           + ("" if not bad else " — " + "; ".join(bad)))
+
+
+def check_user_conf() -> None:
+    """First-time setup discoverability: the per-user clone config is not
+    part of the repo (it holds a PAT); `sz-workspace config` prints the
+    setup. A missing file is a PASS with a setup hint (checkout reuse
+    still works without it); a group/other-readable config is a FAIL —
+    it holds a secret."""
+    conf = Path(os.environ.get("SZ_DEV_CONF",
+                               Path.home() / ".config/sz-dev/config"))
+    if not conf.is_file():
+        record(True, f"user clone config: {conf} not set — auto-clone will "
+                     "prompt for credentials; setup: sz-workspace config")
+        return
+    mode = conf.stat().st_mode & 0o077
+    record(mode == 0, f"user clone config: {conf} present"
+           + ("" if mode == 0 else f" — group/other bits set ({mode:03o}), "
+              "run chmod 600 (it holds a PAT)"))
+
+
+def main() -> int:
+    check_tools_smoke()
+    check_lint()
+    check_selftest()
+    check_pack_tables()
+    check_tools_selftest()
+    check_refs()
+    check_contracts()
+    check_framework_leak()
+    check_hygiene()
+    check_drift()
+    check_description()
+    check_skill_size()
+    check_tools_documented()
+    check_state_keys()
+    check_arch_cache()
+    check_user_conf()
+    fails = sum(1 for ok, _ in results if not ok)
+    print(f"\nsz-doctor: {len(results) - fails} pass, {fails} fail")
+    return 1 if fails else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

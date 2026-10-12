@@ -1,0 +1,797 @@
+#!/bin/bash
+
+# sz-replay — replay-mode plumbing for sz-dev.
+#
+# Fixed operation of the replay workflow (workflows/replay-mode.md):
+# create the isolated implementation tree at the fix commit's parent
+# (the replay baseline), and clean it up (plus package) when done.
+#
+#   init    Clone the repo into the replay tree (standard layout:
+#           {project%_ai}_aireplay/ccsrc; legacy fallback ../replay-<SZ>)
+#           and check out <fix-commit>^ detached. The tree KEEPS .git
+#           (design change, 2026-09-27): prior-art git log/show on OTHER
+#           SZs works in place and baseline bytes are reachable via
+#           `git show <baseline>:<path>`. RED LINE (behavioral, enforced
+#           by review + audit): never display this SZ's own fix commit
+#           or its diff (git show/log -p/diff fix^..fix/format-patch on
+#           FIX_COMMIT). Seed .sz-dev/, copy the workspace's skills/
+#           (and cql/test/ for cql-module SZs — see COPIES below) into
+#           the tree as skip-worktree (invisible to git diff), register
+#           the entry, and print the env every later session needs
+#           (REPLAY_DIR, SZ_DEV_DIR, BASELINE_COMMIT, FIX_COMMIT,
+#           COPIED_*).
+#   status  Print the registered entry (dir, baseline, fix commit).
+#   diff    Working tree vs <baseline>. Clone-based trees: git diff
+#           (injected dirs + .sz-dev excluded via pathspecs; --names
+#           gives the file list). Legacy archive trees (no .git):
+#           re-extract <baseline> to a temp dir and diff -ruN.
+#   finish  Delete the replay tree and its registry entry (diffs and
+#           reports must already be copied out of its .sz-dev/ — pass
+#           --copied-to <dir> to verify the copy and clear them, or
+#           --force to skip the check). Never leaves the tree at
+#           baseline.
+#   package Build the gate-4 delivery tar from the REPLAY WORKING TREE
+#           — the code this run actually implemented and tested (the
+#           fix commit's file may diverge; delivery follows the tested
+#           code, per the 2026-09-24 human decision on SZ22052).
+#           `--fix-commit` restores the old behavior (git archive
+#           <fix-commit> -- <paths> | gzip) for explicit audit
+#           comparison only. Named SZxxxx_<Beijing time>.tar.gz
+#           (or SZxxxx_fix-commit_<...>.tar.gz with --fix-commit),
+#           written directly to ~/sz/.
+#
+# All commands take the ccsrc checkout containing the fix commit as the
+# search root: cwd if it is one, else the sz-workspace registry entry
+# for SZxxxx.
+
+set -euo pipefail
+
+usage() {
+    cat <<EOF
+Usage:
+  $0 init    <SZxxxx> <fix-commit> [--force]
+  $0 status  <SZxxxx>
+  $0 diff    <SZxxxx> [--names] [[--] <path>...]
+  $0 finish  <SZxxxx> [--copied-to <dir>] [--force]
+  $0 package <SZxxxx> [--fix-commit] <path>...  # repo-relative paths
+  $0 exclusions <SZxxxx> [--save <file>]
+  $0 audit   <SZxxxx> [--forbid <token>]...
+  $0 verify  <SZxxxx>
+
+Commands:
+  init     Create the isolated replay tree for SZxxxx at <fix-commit>^
+           (copying the workspace's skills/ into it, plus cql/test/
+           when the fix touches cql/) and print REPLAY_DIR /
+           SZ_DEV_DIR / BASELINE_COMMIT / FIX_COMMIT / COPIED lines
+           for the sessions that follow. Re-running init when a tree
+           already exists for the same SZ + fix is a safe no-op (it
+           reuses the tree and keeps the run state). A stray/mismatched
+           tree is refused with guidance; pass --force to remove it and
+           re-init from scratch.
+  status   Show the registered replay entry for SZxxxx, if any.
+  diff     Diff the working tree against the baseline commit (the
+           replay stand-in for git diff — the tree has no .git).
+           Default: full patch; --names: bare file list (stdout carries
+           only repo-relative paths; all diagnostics go to stderr).
+           Optional repo-relative <path>... arguments (after -- or as
+           trailing args) restrict the diff to those paths.
+  finish   Delete the replay tree + registry entry. Refuses while the
+           tree still holds notes/plans/diffs (.md/.patch) not copied
+           out of its .sz-dev/SZxxxx/. --copied-to <dir> verifies the
+           copy first (every .md/.patch file present and byte-identical
+           under <dir>/SZxxxx/) and clears them so finish proceeds —
+           the honest copy-out path, mechanized; --force skips the
+           check entirely (the dishonest path, recorded as such).
+  package  Tar the named paths from the replay working tree (the
+           Phase 3-tested code) into
+           ~/sz/SZxxxx_<YYYYMMDDHHMM Beijing>.tar.gz for manual
+           attachment to the ticket. With --fix-commit, tar the paths
+           as they exist in the historical fix commit instead, named
+           SZxxxx_fix-commit_<...>.tar.gz — audit-comparison
+           intermediate only, never the delivery.
+  exclusions  The Delta 2 pre-switch pack grep, mechanized with file
+           NAMES ONLY (a content grep would print the excluded files'
+           own lines into the executor's context). Printed files are
+           out of bounds for the whole run; --save persists the list.
+  audit    Replay-contamination check over the run's state artifacts:
+           the fix commit's sha (and short prefixes) plus any --forbid
+           token (backport sha, attachment ids) must appear ONLY in
+           progress.md / phase1-requirement.md — anywhere else is the
+           answer leaking into plans/reviews/drivers/cases.
+  verify   The gate-4 trust chain: change surface must equal
+           changed-paths.txt and the cumulative diff must be
+           byte-identical to the reviewed SZxxxx_gate2.patch — the
+           tested code IS the reviewed code, mechanically proven.
+
+Registry: ~/.sz-dev-workspaces/replay-<SZxxxx> (path file), co-located
+with the sz-workspace registry.
+EOF
+    exit 2
+}
+
+log() { printf '%s\n' "$*" >&2; }
+
+die() { log "ERROR: $*"; exit 1; }
+
+registry_dir() { printf '%s' "${SZ_WORKSPACE_REGISTRY:-$HOME/.sz-dev-workspaces}"; }
+
+registry_entry() { printf '%s/replay-%s' "$(registry_dir)" "${1^^}"; }
+
+# resolve_repo <SZxxxx> [commit] — print a ccsrc checkout; with
+# [commit], one that actually contains it (cat-file -e verified).
+resolve_repo() {
+    local sz="${1^^}" want="${2:-}" dir top f cand
+    # the SZ's own registered workspace first — the cwd checkout (often
+    # the developer checkout, not the standard per-SZ workspace) must not
+    # decide the replay tree's location ({proj}_aireplay vs legacy)
+    dir="$(cat "$(registry_dir)/SZ${sz#SZ}" 2>/dev/null || true)"
+    if [ -n "$dir" ] && [ -d "$dir" ] \
+       && { [ -n "$want" ] && git -C "$dir" cat-file -e "${want}^{commit}" 2>/dev/null || [ -z "$want" ]; }; then
+        printf '%s\n' "$dir"
+        return 0
+    fi
+    top="$(git -C "${SZ_WORKSPACE_DIR:-$PWD}" rev-parse --show-toplevel 2>/dev/null || true)"
+    if [ -n "$top" ] && { [ -d "$top/cql" ] || [ -d "$top/ehr" ]; }; then
+        printf '%s\n' "$top"
+        return 0
+    fi
+    # sz-workspace writes a bare SZxxxx entry per workspace
+    if [ -z "$dir" ] || [ ! -d "$dir" ]; then
+        # no entry for this SZ: try the other registered workspaces
+        # (replay entries carry .path/.meta suffixes and are skipped by
+        # the bare SZ* glob). With a wanted commit, take the first
+        # checkout that actually holds it — not an arbitrary first.
+        dir=""
+        cand=""
+        for f in "$(registry_dir)"/SZ*; do
+            [ -f "$f" ] || continue
+            cand="$(cat "$f")"
+            [ -d "$cand" ] || continue
+            if [ -n "$want" ] && git -C "$cand" cat-file -e "${want}^{commit}" 2>/dev/null; then
+                dir="$cand"
+                break
+            fi
+            [ -n "$dir" ] || dir="$cand"
+        done
+    fi
+    [ -n "$dir" ] && [ -d "$dir" ] || die "no ccsrc checkout found for $sz (run from one, or ensure sz-workspace registry exists)"
+    printf '%s\n' "$dir"
+}
+
+cmd="${1:-}"; [ -n "$cmd" ] || usage
+shift
+case "$cmd" in
+    init)
+        sz="${1:?SZ number required}"; fix="${2:?fix commit required}"; shift 2
+        force=0
+        while [ "$#" -ge 1 ]; do
+            case "$1" in
+                --force) force=1; shift ;;
+                *) usage ;;
+            esac
+        done
+        repo="$(resolve_repo "$sz" "$fix")"
+        git -C "$repo" cat-file -e "${fix}^{commit}" 2>/dev/null || die "commit $fix not found in $repo"
+        baseline="$(git -C "$repo" rev-parse "${fix}^")"
+        # standard layout (the workspace standard {user}_sz{n}_ai/ccsrc):
+        # the replay tree is the sibling project {project%_ai}_aireplay/ccsrc —
+        # the path keeps a "ccsrc" segment, so getsrcroot-bound builds work
+        # directly (no hardlink ccsrc-named copy needed). Non-standard
+        # workspace locations fall back to the legacy sibling
+        # replay-SZxxxx. SZ_REPLAY_TEMPLATE overrides ({proj}/{sz}/{user}).
+        repo_parent="$(dirname "$repo")"
+        proj="$(basename "$repo_parent")"
+        user="$(id -un | tr 'A-Z' 'a-z')"
+        replay_root=""
+        if [ -n "${SZ_REPLAY_TEMPLATE:-}" ]; then
+            rr="${SZ_REPLAY_TEMPLATE}"
+            rr="${rr//\{proj\}/$proj}"; rr="${rr//\{sz\}/$sz}"; rr="${rr//\{user\}/$user}"
+            replay_root="${rr%/}/ccsrc"
+        elif [ "${proj%_aireplay}" != "$proj" ]; then
+            # single-workspace layout: the SZ's registered clone already
+            # IS the replay dir — operate in place
+            replay_root="$repo"
+        elif [ "${proj%_ai}" != "$proj" ]; then
+            replay_root="$(dirname "$repo_parent")/${proj%_ai}_aireplay/ccsrc"
+        fi
+        if [ -z "$replay_root" ]; then
+            replay_root="$(dirname "$repo")/replay-${sz}"
+        fi
+        # when the tree sits at <project>/ccsrc, the removable unit for
+        # finish is the whole project dir
+        project_root="$replay_root"
+        if [ "$(basename "$replay_root")" = "ccsrc" ]; then
+            project_root="$(dirname "$replay_root")"
+        fi
+        if [ "$repo" != "$replay_root" ]; then
+            log "cloning $repo into $replay_root and checking out baseline $baseline ..."
+        else
+            log "seeding replay state in place at $replay_root (baseline $baseline) ..."
+        fi
+        # keep .git in the replay tree (design change, 2026-09-27): a real
+        # clone lets prior-art git log/show run on OTHER SZs in place and
+        # gives baseline byte access (`git show baseline:path`). The
+        # red line is behavioral now: NEVER display this SZ's own fix
+        # commit or its diff (git show/log -p/diff fix^..fix/format-patch
+        # on FIX_COMMIT) — sz-replay audit still checks the artifacts.
+        if [ "$(git -C "$replay_root" rev-parse --show-toplevel 2>/dev/null)" = "$replay_root" ] \
+           && [ -d "$replay_root/.git" ]; then
+            log "single-workspace layout: seeding replay state in place at $replay_root"
+        else
+            # Replay tree already exists at this path: handle gracefully
+            # instead of bluntly dying.
+            #   --force        remove the existing tree and re-init fresh
+            #   matching entry same SZ + same fix already registered here
+            #                 => idempotent no-op (reuse, keep run state)
+            #   otherwise      stale/mismatched tree; refuse with guidance
+            if [ -e "$replay_root" ]; then
+                if [ "$force" -eq 1 ]; then
+                    log "removing existing replay tree at $replay_root (--force) ..."
+                    rm -rf "$replay_root"
+                else
+                    entry="$(registry_entry "$sz")"
+                    recorded_dir="$(cat "${entry}.path" 2>/dev/null || true)"
+                    recorded_fix="$(sed -n 's/^fix=//p' "${entry}.meta" 2>/dev/null || true)"
+                    if [ "$recorded_dir" = "$replay_root" ] && [ "$recorded_fix" = "$fix" ]; then
+                        # Reuse is only valid on a pristine baseline: init
+                        # runs at Phase 0, so any tracked-file modification
+                        # here is a leftover from an earlier run of this SZ
+                        # (worst case: the fix itself sitting in the tree,
+                        # which would fake every red/green verdict). Reset
+                        # tracked files to HEAD (the baseline); untracked
+                        # state (.sz-dev, injected dirs) is untouched, and
+                        # skip-worktree harness files are not reverted.
+                        dirty="$(git -C "$replay_root" status --porcelain --untracked-files=no)"
+                        if [ -n "$dirty" ]; then
+                            git -C "$replay_root" restore --source=HEAD --staged --worktree -- . \
+                                || die "replay tree has leftover tracked changes and the baseline reset failed — clean $replay_root manually"
+                            log "replay tree reused — reset $(printf '%s' "$dirty" | grep -c .) leftover tracked file(s) to baseline $baseline"
+                        fi
+                        log "replay tree for $sz already initialized at $replay_root (fix $fix) — reusing, keeping run state"
+                        printf 'REPLAY_DIR=%s\nSZ_DEV_DIR=%s/.sz-dev\nBASELINE_COMMIT=%s\nFIX_COMMIT=%s\n' \
+                            "$replay_root" "$replay_root" "$baseline" "$fix"
+                        exit 0
+                    fi
+                    msg="$replay_root already exists
+  registered replay for $sz: dir=${recorded_dir:-none} fix=${recorded_fix:-none}
+  finish the prior run first (sz-replay finish $sz), remove the tree, or re-run with --force to re-init"
+                    die "$msg"
+                fi
+            fi
+            git clone --quiet --no-hardlinks "$repo" "$replay_root" || die "clone failed"
+        fi
+        git -C "$replay_root" checkout --quiet --detach "$baseline" || die "checkout $baseline failed"
+        # head start: drop the workspace's per-SZ state and any local refs
+        # noise is irrelevant; the clone keeps full history for prior art
+        mkdir -p "$replay_root/.sz-dev"
+        # Copy run tooling into the baseline tree: the baseline predates
+        # the current harness, and neither source derives from this SZ's
+        # fix (replay-mode.md, "Tooling on an old baseline").
+        #   skills/   — always (module packs, workflows, tools)
+        #   cql/test/ — only when the fix commit touches cql/ (decided
+        #               from the name-status list, never the hunks)
+        # The injected dirs are tracked in the clone, so mark their files
+        # skip-worktree BEFORE overwriting: git status/diff then ignore
+        # them and the change surface stays this SZ's files only.
+        mark_skip_worktree() {
+            git -C "$replay_root" ls-files -z -- "$1" \
+                | xargs -0 -r git -C "$replay_root" update-index --skip-worktree --
+        }
+        # in-place layout: the harness source cannot be the replay tree
+        # itself (it sits at the baseline); take SZ_REPLAY_HARNESS_SRC when
+        # set (e.g. the developer checkout — the registry usually holds no
+        # entry for it), else scan other registered ccsrc checkouts that
+        # carry the current skills/, else degrade to the baseline's own
+        # (older) copies and log it
+        inject_src="$repo"
+        cql_test_src=""
+        if [ "$repo" = "$replay_root" ]; then
+            inject_src=""
+            installed_skill="${SZ_SKILL_INSTALL_DIR:-$HOME/.zcode/skills/sz-dev}"
+            # a checkout whose seeded skill equals the installed
+            # (sync-skill-maintained) copy is fresh; without an installed
+            # reference there is nothing to compare against, so accept
+            skill_fresh() {
+                [ -f "$installed_skill/SKILL.md" ] || return 0
+                diff -rq "$1/skills/sz-dev" "$installed_skill" >/dev/null 2>&1
+            }
+            if [ -n "${SZ_REPLAY_HARNESS_SRC:-}" ] \
+               && [ -f "$SZ_REPLAY_HARNESS_SRC/skills/sz-dev/SKILL.md" ]; then
+                inject_src="$SZ_REPLAY_HARNESS_SRC"
+                log "harness source (in-place layout): $inject_src (SZ_REPLAY_HARNESS_SRC)"
+            fi
+            if [ -z "$inject_src" ]; then
+                # prefer a fresh checkout; a stale first hit used to win
+                # silently and seed the run with an outdated skill copy
+                for pass in fresh any; do
+                    for f in "$(registry_dir)"/SZ*; do
+                        [ -f "$f" ] || continue
+                        case "$(basename "$f")" in *.mode|*path|*meta) continue ;; esac
+                        cand="$(cat "$f")"
+                        [ -d "$cand" ] && [ "$cand" != "$replay_root" ] \
+                            && [ -f "$cand/skills/sz-dev/SKILL.md" ] || continue
+                        [ "$pass" = fresh ] && ! skill_fresh "$cand" && continue
+                        inject_src="$cand" && break
+                    done
+                    [ -n "$inject_src" ] && break
+                done
+            fi
+            if [ -n "$inject_src" ]; then
+                log "harness source (in-place layout): $inject_src"
+                skill_fresh "$inject_src" \
+                    || log "WARNING: $inject_src/skills/sz-dev differs from the installed copy ($installed_skill) — run 'sz-workspace sync-skill' so the replay does not run a stale skill"
+            else
+                log "WARNING: no current harness source found — using the baseline's own skills/ (older pack); record the degradation"
+            fi
+            # cql/test rides the same source by default; the fix needs it,
+            # so fall back to any checkout that carries the harness
+            cql_test_src="$inject_src"
+            if [ -n "$cql_test_src" ] && [ "$cql_test_src" != "$replay_root" ] \
+               && [ ! -d "$cql_test_src/cql/test" ]; then
+                cql_test_src=""
+                for f in "$(registry_dir)"/SZ*; do
+                    [ -f "$f" ] || continue
+                    case "$(basename "$f")" in *.mode|*path|*meta) continue ;; esac
+                    cand="$(cat "$f")"
+                    [ -d "$cand" ] && [ "$cand" != "$replay_root" ] \
+                        && [ -d "$cand/cql/test" ] && cql_test_src="$cand" && break
+                done
+                if [ -n "${SZ_REPLAY_HARNESS_SRC:-}" ] && [ -d "${SZ_REPLAY_HARNESS_SRC:-}/cql/test" ]; then
+                    cql_test_src="$SZ_REPLAY_HARNESS_SRC"
+                fi
+                [ -n "$cql_test_src" ] \
+                    && log "cql/test harness source: $cql_test_src (primary source has no cql/test)" \
+                    || log "WARNING: no checkout carries cql/test — set SZ_REPLAY_HARNESS_SRC to one; the pack check/repro capabilities degrade"
+            fi
+        fi
+        copied=""
+        if [ -d "$inject_src/skills" ]; then
+            mark_skip_worktree skills
+            cp -aT "$inject_src/skills" "$replay_root/skills" 2>/dev/null \
+                || [ "$inject_src" = "$replay_root" ] \
+                || { log "WARNING: skills injection failed; baseline skills stay in use"; }
+            [ "$inject_src" = "$replay_root" ] || copied="skills/"
+            [ "$inject_src" = "$replay_root" ] || log "copied $inject_src/skills -> $replay_root/skills (skip-worktree)"
+        fi
+        if git -C "$repo" diff-tree --no-commit-id --name-only -r "$fix" 2>/dev/null | grep -q '^cql/'; then
+            if [ -n "$cql_test_src" ] && [ "$cql_test_src" != "$replay_root" ] && [ -d "$cql_test_src/cql/test" ]; then
+                mkdir -p "$replay_root/cql"
+                mark_skip_worktree cql/test
+                cp -aT "$cql_test_src/cql/test" "$replay_root/cql/test"
+                copied="$copied cql/test/"
+                log "copied $cql_test_src/cql/test -> $replay_root/cql/test (skip-worktree, fix touches cql/)"
+            elif [ "$repo" != "$replay_root" ] && [ -d "$repo/cql/test" ]; then
+                # clone layout: the cloned repo itself carries the harness
+                mkdir -p "$replay_root/cql"
+                mark_skip_worktree cql/test
+                copied="$copied cql/test/"
+                log "cql/test already present in the clone (fix touches cql/)"
+            else
+                log "WARNING: fix touches cql/ but no harness source carried cql/test — the pack check/repro capabilities degrade; record it"
+            fi
+        fi
+        # expose the run state through the SZ's registered workspace so
+        # the standard workspace stays the single browsing entry point
+        # (.sz-dev/SZxxxx -> replay tree; the symlink dies with the tree
+        # at finish). Never replaces a real state dir.
+        ws_dir="$(cat "$(registry_dir)/SZ${sz#SZ}" 2>/dev/null || true)"
+        if [ -n "$ws_dir" ] && [ "$ws_dir" != "$replay_root" ] \
+           && [ -d "$ws_dir/.sz-dev" ] && [ ! -e "$ws_dir/.sz-dev/SZ${sz#SZ}" ]; then
+            ln -s "$replay_root/.sz-dev/SZ${sz#SZ}" "$ws_dir/.sz-dev/SZ${sz#SZ}" \
+                && log "workspace symlink: $ws_dir/.sz-dev/SZ${sz#SZ} -> replay state"
+        fi
+        entry="$(registry_entry "$sz")"
+        mkdir -p "$(dirname "$entry")"
+        printf '%s\n' "$replay_root" > "${entry}.path"
+        printf 'fix=%s\nbaseline=%s\nrepo=%s\nroot=%s\n' \
+            "$fix" "$baseline" "$repo" "$project_root" > "${entry}.meta"
+        log "replay tree: $replay_root"
+        printf 'REPLAY_DIR=%s\nSZ_DEV_DIR=%s/.sz-dev\nBASELINE_COMMIT=%s\nFIX_COMMIT=%s\n' \
+            "$replay_root" "$replay_root" "$baseline" "$fix"
+        # not `[ -n .. ] && printf` — an empty $copied would make that the
+        # script's exit status (rc=1 on a successful init)
+        if [ -n "$copied" ]; then printf 'COPIED=%s\n' "$copied"; fi
+        exit 0
+        ;;
+    status)
+        sz="${1:?SZ number required}"
+        entry="$(registry_entry "$sz")"
+        [ -f "${entry}.path" ] || die "no replay entry for $sz"
+        printf 'dir=%s\n' "$(cat "${entry}.path")"
+        cat "${entry}.meta" 2>/dev/null || true
+        ;;
+    diff)
+        sz="${1:?SZ number required}"; shift
+        names=0; paths=()
+        while [ "$#" -ge 1 ]; do
+            case "$1" in
+                --names|--name-status) names=1; shift ;;
+                --) shift; while [ "$#" -ge 1 ]; do paths+=("$1"); shift; done ;;
+                -*) usage ;;
+                *) paths+=("$1"); shift ;;
+            esac
+        done
+        entry="$(registry_entry "$sz")"
+        [ -f "${entry}.path" ] || die "no replay entry for $sz"
+        dir="$(cat "${entry}.path")"
+        [ -d "$dir" ] || die "replay tree missing: $dir"
+        meta="$(cat "${entry}.meta" 2>/dev/null || true)"
+        baseline="$(sed -n 's/^baseline=//p' <<<"$meta")"
+        [ -n "$baseline" ] || die "no baseline recorded for $sz (re-run init)"
+        repo="$(sed -n 's/^repo=//p' <<<"$meta")"
+        [ -n "$repo" ] || repo="$(resolve_repo "$sz")"
+        git -C "$repo" cat-file -e "${baseline}^{commit}" 2>/dev/null \
+            || die "baseline commit $baseline not found in $repo"
+        for p in "${paths[@]:-}"; do
+            [ -z "$p" ] && continue
+            git -C "$repo" cat-file -e "${baseline}:$p" 2>/dev/null \
+                || [ -e "$dir/$p" ] \
+                || die "path not in baseline or working tree: $p"
+        done
+        # New layout: the replay tree is a real clone (.git present) at
+        # the baseline commit — diff straight from git. Injected tooling
+        # dirs (copied by init, skip-worktree) and .sz-dev are excluded
+        # via pathspecs: run infrastructure, never this SZ's change
+        # surface. Legacy archive-based trees (no .git) fall through to
+        # the diff -ruN path below.
+        if [ -d "$dir/.git" ]; then
+            ex=(':(exclude).sz-dev' ':(exclude)skills' ':(exclude)cql/test' ':(exclude)test-reports')
+            rc=0
+            if [ "$names" -eq 1 ]; then
+                git -C "$dir" ls-files -z --others --exclude-standard -- . ':(exclude).sz-dev' ':(exclude)skills' ':(exclude)cql/test' ':(exclude)test-reports' \
+                    | xargs -0 -r git -C "$dir" add --intent-to-add -- >/dev/null 2>&1 || true
+                if [ "${#paths[@]}" -gt 0 ]; then
+                    git -C "$dir" diff --name-only "$baseline" -- "${paths[@]}" "${ex[@]}"
+                else
+                    git -C "$dir" diff --name-only "$baseline" -- . "${ex[@]}"
+                fi
+            else
+                git -C "$dir" ls-files -z --others --exclude-standard -- . ':(exclude).sz-dev' ':(exclude)skills' ':(exclude)cql/test' ':(exclude)test-reports' \
+                    | xargs -0 -r git -C "$dir" add --intent-to-add -- >/dev/null 2>&1 || true
+                if [ "${#paths[@]}" -gt 0 ]; then
+                    for p in "${paths[@]}"; do
+                        git -C "$dir" diff --binary "$baseline" -- "$p" || rc=$?
+                    done
+                    [ "$rc" -le 1 ] || exit "$rc"
+                else
+                    git -C "$dir" diff --binary "$baseline" -- . "${ex[@]}" || rc=$?
+                    [ "$rc" -le 1 ] || exit "$rc"
+                fi
+            fi
+            exit 0
+        fi
+        # legacy layout (archive tree without .git): re-extract the baseline
+        # to a temp dir (equal-depth symlink keeps patch paths usable:
+        # patch -R -p1 -d "$dir") and diff the two trees
+        # temp dir must live on the same volume as the replay tree:
+        # cross-volume tmp (e.g. /tmp on another mount) breaks the
+        # link/copy fallback below under Git Bash on Windows
+        tmp="$(mktemp -d "$dir/../.sz-replay-diff.XXXXXX")"
+        trap 'rm -rf "$tmp"' EXIT
+        mkdir -p "$tmp/baseline"
+        log "extracting baseline $baseline for diff ..."
+        git -C "$repo" archive "$baseline" | tar -x -C "$tmp/baseline"
+        # equal-depth link keeps patch paths usable (patch -R -p1 -d "$dir").
+        # symlink → hard-link tree (cp -al) → plain copy fallbacks: symlink
+        # fails on some Git Bash setups, cp -al fails cross-volume
+        ln -s "$dir" "$tmp/working" 2>/dev/null \
+            || { cp -al "$dir" "$tmp/working" 2>/dev/null \
+                 || cp -a "$dir" "$tmp/working"; }
+        # diff exits 1 when differences exist — that is success here
+        # injected tooling dirs (copied by init) are excluded: they are
+        # run infrastructure, never this SZ's change surface. diff -x
+        # matches basenames, so --exclude=test hides any test/ dir —
+        # acceptable in replay: the harness is infra there, and the
+        # authoritative change set is changed-paths.txt anyway.
+        # test-reports/ is the check harness's output dir (cql/test/
+        # writes it at the repo root, and baselines lack the .gitignore
+        # entry) — harness output, never the change surface.
+        ex=(--exclude=.sz-dev --exclude=skills --exclude=test --exclude=test-reports)
+        rc=0
+        map_names() {
+            # diff -rqN output (baseline/... working/... form) -> repo-relative paths
+            awk '
+                /^Files baseline\// { p=$2; sub(/^baseline\//, "", p); print p; next }
+                /^Only in working\// { d=$3; sub(/^working\//, "", d); sub(/:$/, "", d); print d "/" $4; next }
+                /^Only in baseline\// { d=$3; sub(/^baseline\//, "", d); sub(/:$/, "", d); print d "/" $4; next }
+            '
+        }
+        if [ "$names" -eq 1 ]; then
+            # stdout carries ONLY repo-relative paths (created, modified
+            # and deleted alike); diff's own diagnostics stay on stderr
+            if [ "${#paths[@]}" -gt 0 ]; then
+                for p in "${paths[@]}"; do
+                    in_b=0; in_w=0
+                    if [ -e "$tmp/baseline/$p" ] || [ -L "$tmp/baseline/$p" ]; then in_b=1; fi
+                    if [ -e "$tmp/working/$p" ] || [ -L "$tmp/working/$p" ]; then in_w=1; fi
+                    if [ "$in_b" -eq 1 ] && [ "$in_w" -eq 1 ]; then
+                        if [ -d "$tmp/baseline/$p" ]; then
+                            out="$( cd "$tmp" && diff -rq "${ex[@]}" "baseline/$p" "working/$p" 2>/dev/null )" || true
+                            printf '%s\n' "$out" | map_names
+                        else
+                            cmp -s "$tmp/baseline/$p" "$tmp/working/$p" || printf '%s\n' "$p"
+                        fi
+                    elif [ "$in_b" -eq 1 ] || [ "$in_w" -eq 1 ]; then
+                        # created (working-only) or deleted (baseline-only):
+                        # both are part of the change surface
+                        printf '%s\n' "$p"
+                    fi
+                done
+            else
+                out="$( cd "$tmp" && diff -rqN "${ex[@]}" baseline working 2>/dev/null )" || true
+                printf '%s\n' "$out" | map_names
+            fi
+        else
+            if [ "${#paths[@]}" -gt 0 ]; then
+                for p in "${paths[@]}"; do
+                    (cd "$tmp" && diff -ruN "baseline/$p" "working/$p") || rc=$?
+                    [ "$rc" -le 1 ] || exit "$rc"
+                done
+            else
+                (cd "$tmp" && diff -ruN "${ex[@]}" baseline working) || rc=$?
+                [ "$rc" -le 1 ] || exit "$rc"
+            fi
+        fi
+        ;;
+    finish)
+        sz="${1:?SZ number required}"; shift
+        force=0; copied_to=""
+        while [ "$#" -ge 1 ]; do
+            case "$1" in
+                --force) force=1; shift ;;
+                --copied-to) [ "$#" -ge 2 ] || usage; copied_to="$2"; shift 2 ;;
+                *) usage ;;
+            esac
+        done
+        entry="$(registry_entry "$sz")"
+        [ -f "${entry}.path" ] || die "no replay entry for $sz"
+        dir="$(cat "${entry}.path")"
+        if [ "$force" -ne 1 ] && [ -d "$dir/.sz-dev" ]; then
+            sid="$(printf '%s' "$sz" | tr 'a-z' 'A-Z')"
+            case "$sid" in SZ*) ;; *) sid="SZ$sid" ;; esac
+            if [ -n "$copied_to" ]; then
+                # honest copy-out path, mechanized: verify every guard
+                # file (.md/.patch) exists byte-identical under the copy,
+                # then clear the guard so finish proceeds. <dir> is the
+                # copy of .sz-dev (containing SZxxxx/); passing the
+                # SZxxxx directory itself also works.
+                if [ "$(basename "$copied_to")" = "$sid" ]; then
+                    croot="$copied_to"; relstrip="$dir/.sz-dev/$sid/"
+                else
+                    croot="$copied_to"; relstrip="$dir/.sz-dev/"
+                fi
+                [ -d "$croot" ] || die "--copied-to: no copy at $copied_to (pass the .sz-dev copy or the SZxxxx dir)"
+                bad=0
+                while IFS= read -r f; do
+                    rel="${f#"$relstrip"}"
+                    if ! cmp -s "$f" "$croot/$rel"; then
+                        log "NOT COPIED OR DIFFERS: $rel"
+                        bad=1
+                    fi
+                done < <(find "$dir/.sz-dev" -type f \( -name '*.md' -o -name '*.patch' \))
+                [ "$bad" -eq 0 ] || die "copy-out verification failed — copy the listed files out (rsync + diff -rq) and re-run, or pass --force"
+                find "$dir/.sz-dev" -type f \( -name '*.md' -o -name '*.patch' \) -delete
+                log "verified copy in $croot; guard files cleared"
+            else
+                # artifacts must already be copied out of the run's state tree
+                if find "$dir/.sz-dev" -type f \( -name '*.md' -o -name '*.patch' \) | grep -q .; then
+                    die "$dir/.sz-dev still holds notes/plans/diffs — copy them out of the replay tree first (or finish with --copied-to <dir> to verify + clear), or pass --force"
+                fi
+            fi
+        fi
+        rm -rf "$dir"
+        # standard layout nests the tree at <project>/ccsrc: remove the
+        # whole _aireplay project dir, not just the ccsrc level
+        root="$(sed -n 's/^root=//p' <<<"$(cat "${entry}.meta" 2>/dev/null || true)")"
+        if [ -n "$root" ] && [ "$root" != "$dir" ] && [ -d "$root" ]; then
+            rm -rf "$root"
+        fi
+        rm -f "${entry}.path" "${entry}.meta"
+        log "replay tree for $sz removed"
+        ;;
+    package)
+        sz="${1:?SZ number required}"; shift
+        from_fix=0
+        while [ "$#" -ge 1 ]; do
+            case "$1" in
+                --fix-commit) from_fix=1; shift ;;
+                *) break ;;
+            esac
+        done
+        [ "$#" -ge 1 ] || die "at least one repo-relative path required"
+        out_dir="${SZ_PACKAGE_DIR:-$HOME/sz}"
+        mkdir -p "$out_dir"
+        ts="$(TZ=Asia/Shanghai date +%Y%m%d%H%M)"
+        if [ "$from_fix" -eq 1 ]; then
+            # audit-comparison intermediate: the fix commit's file, not
+            # the tested code — suffix-marked so it is never mistaken
+            # for the gate-4 delivery
+            entry="$(registry_entry "$sz")"
+            [ -f "${entry}.meta" ] || die "no replay entry for $sz"
+            meta="$(cat "${entry}.meta")"
+            fix="$(sed -n 's/^fix=//p' <<<"$meta")"
+            [ -n "$fix" ] || die "no fix commit recorded for $sz"
+            repo="$(sed -n 's/^repo=//p' <<<"$meta")"
+            [ -n "$repo" ] || repo="$(resolve_repo "$sz")"
+            for p in "$@"; do
+                git -C "$repo" cat-file -e "$fix:$p" || die "$p not in $fix"
+            done
+            out="$out_dir/${sz^^}_fix-commit_${ts}.tar.gz"
+            git -C "$repo" archive "$fix" -- "$@" | gzip > "$out"
+        else
+            # delivery default: the replay working tree — the exact code
+            # this run implemented and Phase 3-tested. Delivery follows
+            # the tested code even when the (never-read) historical fix
+            # would differ.
+            entry="$(registry_entry "$sz")"
+            [ -f "${entry}.path" ] || die "no replay entry for $sz"
+            dir="$(cat "${entry}.path")"
+            [ -d "$dir" ] || die "replay tree missing: $dir"
+            for p in "$@"; do
+                [ -f "$dir/$p" ] || die "$p not in the replay working tree"
+            done
+            out="$out_dir/${sz^^}_${ts}.tar.gz"
+            tar -czf "$out" -C "$dir" --exclude=.sz-dev "$@"
+        fi
+        log "package: $out"
+        tar -tzf "$out"
+        ;;
+    exclusions)
+        # Delta 2 source 3, mechanized: the pre-switch pack grep with FILE
+        # NAMES ONLY (-rln) — a content grep would print the excluded
+        # files' own lines into the executor's context. Every printed file
+        # is out of bounds for this SZ's whole run; --save persists the
+        # list for the audit step.
+        sz="${1:?SZ number required}"; shift
+        save=""
+        while [ "$#" -ge 1 ]; do
+            case "$1" in
+                --save) [ "$#" -ge 2 ] || usage; save="$2"; shift 2 ;;
+                *) usage ;;
+            esac
+        done
+        repo="$(resolve_repo "$sz")"
+        num="${sz#SZ}"
+        hits="$(grep -rlnE "(^|[^0-9])$num([^0-9]|$)" "$repo/skills/sz-dev/references/" 2>/dev/null || true)"
+        hits="$(printf '%s\n' "$hits" | sed "s|^$repo/||" | grep -v '^$' || true)"
+        if [ -z "$hits" ]; then
+            log "exclusions: no pack file references SZ$num"
+        else
+            printf '%s\n' "$hits"
+            n="$(printf '%s\n' "$hits" | wc -l)"
+            log "exclusions: $n file(s) OUT OF BOUNDS for SZ$num (do not open, even to grep)"
+        fi
+        if [ -n "$save" ]; then
+            printf '%s\n' "$hits" > "$save"
+            log "exclusions: saved to $save"
+        fi
+        ;;
+    audit)
+        # replay-contamination audit over the run's state artifacts: the
+        # fix commit's sha (and its short prefixes) plus any --forbid
+        # token (backport sha, attachment ids) must appear ONLY in the
+        # sanctioned bookkeeping files — progress.md notes, the phase1
+        # exclusion table, and the two RAW TICKET CACHES (ticket-body.md
+        # / ticket-comments.md: the ticket's own words, including the
+        # C-3PO check-in comment, which every phase legitimately re-reads).
+        # Anywhere else (plans, reviews, drivers, case files, patches,
+        # arbitrary attachments — an attachment may carry pasted fix
+        # code) is the answer leaking into the work. Complements the
+        # reviewer's judgment; does not replace it.
+        sz="${1:?SZ number required}"; shift
+        forbid=()
+        while [ "$#" -ge 1 ]; do
+            case "$1" in
+                --forbid) [ "$#" -ge 2 ] || usage; forbid+=("$2"); shift 2 ;;
+                *) usage ;;
+            esac
+        done
+        entry="$(registry_entry "$sz")"
+        [ -f "${entry}.path" ] || die "no replay entry for $sz (audit runs after init)"
+        dir="$(cat "${entry}.path")"
+        [ -d "$dir" ] || die "replay tree missing: $dir"
+        meta="$(cat "${entry}.meta" 2>/dev/null || true)"
+        fix="$(sed -n 's/^fix=//p' <<<"$meta")"
+        state="$dir/.sz-dev/SZ${sz#SZ}"
+        [ -d "$state" ] || state="$dir/.sz-dev"
+        allowed="$state/progress.md $state/phase1-requirement.md"
+        [ -f "$state/attachment/ticket-body.md" ] \
+            && allowed="$allowed $state/attachment/ticket-body.md"
+        [ -f "$state/attachment/ticket-comments.md" ] \
+            && allowed="$allowed $state/attachment/ticket-comments.md"
+        tokens="$fix"
+        [ ${#forbid[@]} -gt 0 ] && tokens="$tokens ${forbid[*]}"
+        # In-bounds input attachments are NOT forbidden material: phase1's
+        # `driver data:` provenance names the attachments the run's
+        # drivers legitimately load and the docs legitimately cite. Drop
+        # them from the token set automatically (observed failure: the
+        # caller --forbids the input attachment and every artifact with
+        # driver provenance false-positives as contamination).
+        if [ -f "$state/phase1-requirement.md" ]; then
+            # ONLY the driver-data provenance lines declare in-bounds
+            # inputs — the file's other sections legitimately mention
+            # excluded attachment ids ("attachment 76801 NEVER fetched")
+            # and mentioning is not declaring.
+            inbound="$(grep -i 'driver data:' "$state/phase1-requirement.md" \
+                | grep -oiE 'attachment [0-9]+' \
+                | awk '{print $2}' | sort -u || true)"
+            if [ -n "$inbound" ]; then
+                kept=""
+                for tok in $tokens; do
+                    drop=0
+                    case "$tok" in *[!0-9]*) ;; *)  # numeric tokens only
+                        for i in $inbound; do
+                            [ "$tok" = "$i" ] && drop=1
+                        done ;;
+                    esac
+                    if [ "$drop" -eq 1 ]; then
+                        log "note: --forbid $tok is an in-bounds driver-data attachment (phase1) — exempted"
+                    else
+                        kept="$kept $tok"
+                    fi
+                done
+                tokens="${kept# }"
+                [ -n "$tokens" ] || tokens="$fix"
+            fi
+        fi
+        bad=0
+        for tok in $tokens; do
+            [ -n "$tok" ] || continue
+            short="$(printf '%s' "$tok" | cut -c1-7)"
+            while IFS= read -r -d '' f; do
+                skip=0
+                for a in $allowed; do [ "$f" = "$a" ] && skip=1; done
+                [ "$skip" -eq 1 ] && continue
+                if grep -qF "$tok" "$f" || grep -qE "(^|[^0-9a-f])$short([^0-9a-f]|$)" "$f"; then
+                    log "CONTAMINATION: $tok (or short $short) in ${f#"$dir/"}"
+                    bad=1
+                fi
+            done < <(find "$state" -type f \( -name '*.md' -o -name '*.scm' -o -name '*.yaml' \
+                        -o -name '*.yml' -o -name '*.patch' -o -name '*.txt' \) -print0)
+        done
+        if [ "$bad" -eq 0 ]; then
+            log "audit: clean — forbidden tokens confined to the sanctioned bookkeeping files (progress.md, phase1-requirement.md, raw ticket caches)"
+        else
+            die "audit: replay contamination (see CONTAMINATION lines) — the affected artifacts must be re-derived without the excluded sources"
+        fi
+        ;;
+    verify)
+        # The gate-4 trust chain, mechanized: the tested code (working
+        # tree) must still BE the reviewed code — the change surface must
+        # equal changed-paths.txt and the cumulative diff must be
+        # byte-identical to the reviewed gate-2 checkpoint patch.
+        sz="${1:?SZ number required}"; shift
+        entry="$(registry_entry "$sz")"
+        [ -f "${entry}.path" ] || die "no replay entry for $sz"
+        dir="$(cat "${entry}.path")"
+        [ -d "$dir" ] || die "replay tree missing: $dir"
+        sid="SZ${sz#SZ}"
+        state="$dir/.sz-dev/$sid"
+        paths_file="$state/changed-paths.txt"
+        gate2="$state/checkpoints/${sid}_gate2.patch"
+        [ -f "$paths_file" ] || die "missing $paths_file"
+        [ -f "$gate2" ] || die "missing $gate2"
+        tmp="$(mktemp)"
+        trap 'rm -f "$tmp"' EXIT
+        # nested invocations go through bash explicitly (the tool ships
+        # without an execute bit by convention)
+        rc=0
+        SZ_DEV_DIR="$(dirname "$state")" bash "$0" diff "$sz" --names 2>/dev/null | sort > "$tmp" || rc=$?
+        fail=0
+        if sort "$paths_file" | grep -v '^$' | diff -q - "$tmp" >/dev/null 2>&1; then
+            log "verify: change surface == changed-paths.txt OK"
+        else
+            log "verify: FAIL — working-tree change surface differs from changed-paths.txt:"
+            log "  (diff of sorted lists; left = changed-paths.txt, right = working tree)"
+            sort "$paths_file" | grep -v '^$' | diff "$tmp" - 2>/dev/null | sed 's/^/  /' >&2 || true
+            fail=1
+        fi
+        SZ_DEV_DIR="$(dirname "$state")" bash "$0" diff "$sz" 2>/dev/null | cmp -s - "$gate2" \
+            && log "verify: cumulative diff == ${sid}_gate2.patch OK" \
+            || { log "verify: FAIL — working tree no longer matches the reviewed gate-2 patch (code changed after review)"; fail=1; }
+        [ "$fail" -eq 0 ] || die "verify: FAILED"
+        log "verify: the tested code IS the reviewed code"
+        ;;
+    *)
+        usage ;;
+esac

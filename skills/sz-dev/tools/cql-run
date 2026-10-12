@@ -1,0 +1,133 @@
+#!/bin/bash
+
+# cql-run — the ONLY sanctioned way for sz-dev runs to invoke the cql
+# engine. Makes the repro.md "driver-runtime traps" discipline
+# structural instead of per-run memory:
+#
+#   - timeout + file-size ulimit on EVERY invocation (an error landing
+#     in the cqlError> prompt, or a stdin BEL loop, otherwise spins at
+#     100% CPU emitting GB-scale output — two documented /tmp-fill
+#     incidents);
+#   - stdin discipline: any line longer than ~900 chars, or multi-line
+#     nested forms, hangs the engine's line editor — stdin is staged to
+#     a spool file and refused if it violates the line-length rule,
+#     with the (load "<abs>") workaround named;
+#   - explicit env: a missing $CCRUN is the root of misleading
+#     file-not-found/segfault signatures — refused unless --allow-no-ccrun.
+#
+# Usage:
+#   cql-run [--timeout SEC] [--max-out-mb N] [--allow-no-ccrun]
+#           [--env VAR=VALUE]... [engine args...]
+#   e.g. cql-run --env CCRUN=/fbch -- -b -n <<<'(print "hi")'
+#   (everything after -- is passed to the engine verbatim; with no --,
+#    all arguments are passed through; forms go on STDIN — this engine
+#    build has no -e flag)
+#
+# Env: CQL_TIMEOUT (default 120s), CQL_MAX_OUT_MB (default 500).
+# Exit: engine's exit code; 124 on timeout; 125 on wrapper refusal.
+
+set -u
+
+timeout_s="${CQL_TIMEOUT:-120}"
+max_out_mb="${CQL_MAX_OUT_MB:-500}"
+allow_no_ccrun=0
+args=()
+
+while [ "$#" -ge 1 ]; do
+    case "$1" in
+        --timeout)      [ "$#" -ge 2 ] || { echo "cql-run: --timeout needs a value" >&2; exit 125; }
+                        timeout_s="$2"; shift 2 ;;
+        --max-out-mb)   [ "$#" -ge 2 ] || { echo "cql-run: --max-out-mb needs a value" >&2; exit 125; }
+                        max_out_mb="$2"; shift 2 ;;
+        --allow-no-ccrun) allow_no_ccrun=1; shift ;;
+        --env)          [ "$#" -ge 2 ] || { echo "cql-run: --env needs VAR=VALUE" >&2; exit 125; }
+                        case "$2" in *=*) export "${2%%=*}=${2#*=}" ;; *)
+                            echo "cql-run: --env expects VAR=VALUE, got: $2" >&2; exit 125 ;; esac
+                        shift 2 ;;
+        --)             shift; while [ "$#" -ge 1 ]; do args+=("$1"); shift; done ;;
+        -*)             echo "cql-run: unknown option: $1" >&2; exit 125 ;;
+        *)              args+=("$1"); shift ;;
+    esac
+done
+
+if [ "${#args[@]}" -eq 0 ]; then
+    cat >&2 <<'EOF'
+usage: cql-run [--timeout SEC] [--max-out-mb N] [--allow-no-ccrun]
+               [--env VAR=VALUE]... [engine args...]
+Wraps the cql engine with mandatory timeout + output cap + stdin
+discipline. See skills/sz-dev/references/cql/repro.md driver-runtime
+traps for why each guard exists.
+EOF
+    exit 2
+fi
+
+if [ -n "${CCRUN:-}" ]; then
+    engine="${CCRUN_BIN:-$CCRUN/bin/cql}"
+elif [ -n "${CCRUN_BIN:-}" ]; then
+    engine="$CCRUN_BIN"
+else
+    engine="cql"
+fi
+if [ -z "${CCRUN:-}" ]; then
+    if [ "$allow_no_ccrun" -ne 1 ]; then
+        echo "cql-run: REFUSED — \$CCRUN is not set (misleading file-not-found/" >&2
+        echo "        segfault signatures follow from it). Export it via --env or the" >&2
+        echo "        environment, or pass --allow-no-ccrun for pure -e smoke tests." >&2
+        exit 125
+    fi
+fi
+if [ "$allow_no_ccrun" -eq 0 ] && [ ! -x "$engine" ]; then
+    echo "cql-run: REFUSED — engine not executable at $engine" >&2
+    exit 125
+fi
+
+# stdin discipline: stage piped input, refuse long lines (the engine's
+# line editor hangs forever on >~900-char lines and multi-line nested
+# forms — repro.md driver-runtime traps)
+spool=""
+cleanup() { [ -n "$spool" ] && rm -f "$spool"; }
+trap cleanup EXIT
+if [ ! -t 0 ]; then
+    spool="$(mktemp /tmp/cql-run-stdin.XXXXXX)"
+    # the spool itself is size-capped by the ulimit below (same process)
+    cat > "$spool"
+    if awk '{ if (length($0) > 900) { bad=1; exit } } END { exit !bad }' "$spool"; then
+        echo "cql-run: REFUSED — stdin carries a line over 900 chars; the engine's" >&2
+        echo "        line editor hangs on it (BEL loop, fills /tmp). Put the forms in" >&2
+        echo "        a file and drive them via (load \"/absolute/path/file.scm\") instead." >&2
+        exit 125
+    fi
+fi
+
+# output cap: RLIMIT_FSIZE does NOT bound pipe writes on Linux, so the
+# engine's stdout is spooled to a file under the ulimit and emitted
+# afterwards (batch runs capture evidence to files anyway). SIGXFSZ
+# kills the engine when the spool exceeds the cap.
+spool_out="$(mktemp /tmp/cql-run-out.XXXXXX)"
+cleanup() { rm -f "${spool:-}" "$spool_out"; }
+trap cleanup EXIT
+
+max_out_blocks=$((max_out_mb * 1024))
+rc=0
+if [ -n "$spool" ]; then
+    ( ulimit -f "$max_out_blocks" 2>/dev/null || true
+      timeout --signal=TERM --kill-after=5 "$timeout_s" "$engine" "${args[@]}" < "$spool" > "$spool_out" ) || rc=$?
+else
+    ( ulimit -f "$max_out_blocks" 2>/dev/null || true
+      timeout --signal=TERM --kill-after=5 "$timeout_s" "$engine" "${args[@]}" > "$spool_out" ) || rc=$?
+fi
+case "$rc" in
+    124)
+        echo "cql-run: ENGINE TIMEOUT after ${timeout_s}s — killed. If this reproduced," >&2
+        echo "        check for a cqlError> prompt spin or a BEL loop in the output;" >&2
+        echo "        raise --timeout only with evidence the run is legitimately long." >&2
+        ;;
+    153)
+        echo "cql-run: OUTPUT CAP hit (${max_out_mb}MB) — engine killed by SIGXFSZ." >&2
+        echo "        A healthy engine run produces KBs, not hundreds of MBs; the" >&2
+        echo "        driver is likely in an error-prompt spin. Do NOT raise the cap" >&2
+        echo "        without understanding the output first." >&2
+        ;;
+esac
+cat "$spool_out"
+exit "$rc"

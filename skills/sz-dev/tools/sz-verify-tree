@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+
+# sz-verify-tree — mechanical no-commit / in-scope verification for a
+# standard sz-dev run (SKILL.md hard rules 3 and 5, turned into checks).
+#
+#   1. HEAD is unchanged since Phase 0: progress.md's `base` sha equals
+#      `git rev-parse HEAD` — no commit was made under the no-commit rule.
+#   2. The working-tree change set equals `changed-paths.txt` — the run
+#      touched exactly the planned files, nothing else (strays reported;
+#      planned-but-untouched paths warned).
+#
+# Exit: 0 clean (warnings allowed) | 1 findings (fix before the gate) |
+#       2 usage / state error.
+#
+# Replay runs refuse here by design — the replay tree's HEAD sits at the
+# baseline commit on purpose; `sz-replay verify` is the equivalent there
+# (tested code == reviewed code, against the replay change surface).
+#
+# Usage:
+#   $0 <SZxxxx> [--workdir <path>] [--gate4]
+#                                        (--workdir overrides the workspace
+#                                        root; default: the state root's
+#                                        parent — the Phase 0 workspace)
+# --gate4 adds the mechanical gate-4 evidence checks: the CHANGES patch's
+# file set == changed-paths.txt, the recorded delivery package's tar
+# listing == changed-paths.txt (no .sz-dev/ leakage), phase4-handoff.md
+# non-empty, RN*/TC* deliverables on disk. What remains for the human at
+# gate 4 is exactly what a script cannot judge: reading the diff and the
+# behavior. Replay runs: `sz-replay verify` + `sz-replay audit` instead.
+#
+# State root resolution mirrors sz-progress: $SZ_DEV_DIR, else the nearest
+# .sz-dev/ at or above the cwd, else the sz-workspace registry entry.
+
+set -euo pipefail
+
+usage() {
+    cat <<EOF
+Usage:
+  $0 <SZxxxx> [--workdir <path>] [--gate4]
+
+Mechanical no-commit / in-scope verification for a standard run:
+  - HEAD unchanged since Phase 0 (progress.md 'base' == git rev-parse HEAD)
+  - working-tree change set == changed-paths.txt (strays fail; a shared
+    checkout recorded via .sz-dev/.shared-inplace downgrades them to
+    warnings — they may belong to another SZ's run)
+  --gate4: CHANGES patch file set == changed-paths.txt; delivery package
+    listing == changed-paths.txt; handoff + RN/TC deliverables on disk
+
+Exit: 0 clean | 1 findings | 2 usage or state error.
+Replay runs: use 'sz-replay verify' instead (this tool refuses).
+EOF
+    exit 2
+}
+
+[[ $# -ge 1 ]] || usage
+ID="${1^^}"; ID="${ID#SZ}"
+[[ "$ID" =~ ^[0-9]+$ ]] || { echo "ERROR: invalid SZ: $1"; exit 2; }
+shift
+workdir_override=""
+gate4=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --workdir) [[ $# -ge 2 ]] || usage; workdir_override="$2"; shift 2 ;;
+        --gate4) gate4=1; shift ;;
+            *) usage ;;
+    esac
+done
+
+fail=0
+warn=0
+ok()   { printf 'PASS  %s\n' "$*"; }
+bad()  { printf 'FAIL  %s\n' "$*"; fail=1; }
+note() { printf 'WARN  %s\n' "$*"; warn=$((warn + 1)); }
+
+# ---- state root resolution (same order as sz-progress) --------------------
+registry_dir() { printf '%s\n' "${SZ_WORKSPACE_REGISTRY:-$HOME/.sz-dev-workspaces}"; }
+
+resolve_state_root() {
+    local d reg
+    if [[ -n "${SZ_DEV_DIR:-}" ]]; then
+        printf '%s\n' "$SZ_DEV_DIR"
+        return 0
+    fi
+    d="$PWD"
+    while :; do
+        if [[ -d "$d/.sz-dev" ]]; then
+            printf '%s\n' "$d/.sz-dev"
+            return 0
+        fi
+        [[ "$d" == "/" ]] && break
+        d="$(dirname "$d")"
+    done
+    reg="$(registry_dir)/SZ${ID}"
+    if [[ -f "$reg" ]]; then
+        printf '%s/.sz-dev\n' "$(cat "$reg")"
+        return 0
+    fi
+    echo "ERROR: no .sz-dev/ state root found (cwd, \$SZ_DEV_DIR, registry) for SZ${ID}." >&2
+    exit 2
+}
+
+ROOT_DIR="$(resolve_state_root)"
+SZ_DIR="${ROOT_DIR}/SZ${ID}"
+FILE="${SZ_DIR}/progress.md"
+[[ -f "$FILE" ]] || { echo "ERROR: no progress file at ${FILE} — run Phase 0/1 first."; exit 2; }
+
+# ---- replay runs are sz-replay verify's job -------------------------------
+mode_file="$(registry_dir)/SZ${ID}.mode"
+if [[ -f "$mode_file" && "$(cat "$mode_file")" == "replay" ]]; then
+    echo "ERROR: SZ${ID} is a replay run — the replay tree's HEAD sits at the"
+    echo "       baseline commit by design. Use: bash \"\$SKILL_DIR/tools/sz-replay\" verify SZ${ID}"
+    exit 2
+fi
+
+workdir="${workdir_override:-$(dirname "$ROOT_DIR")}"
+if ! git -C "$workdir" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "ERROR: $workdir is not a git checkout (fix --workdir or the workspace)."
+    exit 2
+fi
+
+base="$(grep -m1 '^base: ' "$FILE" 2>/dev/null | sed 's/^base: //' || true)"
+if [[ -z "$base" ]]; then
+    echo "ERROR: progress.md has no 'base:' sha — record it once at Phase 0:"
+    echo "       bash \"\$SKILL_DIR/tools/sz-progress\" set SZ${ID} meta base \"\$(git rev-parse HEAD)\""
+    exit 2
+fi
+
+# ---- check 1: no commit since Phase 0 --------------------------------------
+head_now="$(git -C "$workdir" rev-parse HEAD)"
+if [[ "$head_now" == "$base" ]]; then
+    ok "HEAD unchanged since Phase 0 (${head_now})"
+else
+    bad "HEAD moved: base=${base} now=${head_now} — a commit was made (hard rule 3) or the tree changed; stop and reconcile"
+fi
+
+# ---- check 2: working tree == changed-paths.txt ----------------------------
+plan_file="${SZ_DIR}/changed-paths.txt"
+if [[ ! -f "$plan_file" ]]; then
+    bad "no changed-paths.txt at ${plan_file} — Phase 2 Step 1 must write it (it is the authoritative Phase 4 change list)"
+else
+    planned="$(grep -vE '^\s*(#|$)' "$plan_file" | sed 's/[[:space:]]*$//' | sort -u)"
+    changed="$(git -C "$workdir" status --porcelain \
+        | sed -n 's/^.. //p' \
+        | sed 's/.* -> //' \
+        | sed 's/^"\(.*\)"$/\1/' \
+        | grep -v '^\.sz-dev/' \
+        | sort -u)"
+
+    strays="$(comm -23 <(printf '%s\n' "$changed") <(printf '%s\n' "$planned"))"
+    untouched="$(comm -13 <(printf '%s\n' "$changed") <(printf '%s\n' "$planned"))"
+
+    if [[ -z "$strays" ]]; then
+        ok "no stray changes — working tree matches changed-paths.txt"
+    elif [[ -f "${ROOT_DIR}/.shared-inplace" ]]; then
+        note "shared checkout (.shared-inplace present) — these strays may belong to another SZ's run; reconcile before packaging:"
+        printf '%s\n' "$strays" | sed 's/^/        /'
+    else
+        bad "stray changes outside the plan (revert them or extend the plan first):"
+        printf '%s\n' "$strays" | sed 's/^/        /'
+    fi
+
+    if [[ -n "$untouched" ]]; then
+        note "planned paths with no working-tree change (dropped by Phase 4's plan∩diff intersection):"
+        printf '%s\n' "$untouched" | sed 's/^/        /'
+    fi
+fi
+
+# ---- gate-4 evidence (mechanical; --gate4) ---------------------------------
+if [[ "$gate4" -eq 1 ]]; then
+    dlv="$SZ_DIR/deliverables"
+    if [[ ! -f "$SZ_DIR/phase4-handoff.md" ]] || [[ ! -s "$SZ_DIR/phase4-handoff.md" ]]; then
+        bad "phase4-handoff.md missing or empty"
+    else
+        ok "phase4-handoff.md present"
+    fi
+    for f in "$dlv"/RN*.md "$dlv"/TC*.md; do
+        [[ -e "$f" ]] || bad "missing deliverable: ${f#"$SZ_DIR"/} (ls pattern: $(basename "$f"))"
+    done
+    ls "$dlv"/RN*.md >/dev/null 2>&1 && ls "$dlv"/TC*.md >/dev/null 2>&1 \
+        && ok "RN*/TC* deliverables on disk"
+    patch="$dlv/CHANGES-SZ${ID}.patch"
+    if [[ ! -f "$patch" ]]; then
+        bad "missing deliverables/CHANGES-SZ${ID}.patch (the primary audit artifact)"
+    else
+        patch_files="$(grep '^diff --git' "$patch" | sed 's/^diff --git a\/\([^ ]*\) b\/.*/\1/' | sort -u)"
+        if [[ "$patch_files" == "$planned" ]]; then
+            ok "CHANGES patch file set == changed-paths.txt"
+        else
+            bad "CHANGES patch file set != changed-paths.txt:"
+            diff <(printf '%s\n' "$patch_files") <(printf '%s\n' "$planned") | sed 's/^/        /'
+        fi
+    fi
+    pkg="$(grep -m1 '^package: ' "$FILE" 2>/dev/null | sed 's/^package: //' || true)"
+    if [[ -z "$pkg" ]]; then
+        bad "no 'package:' meta recorded — build the delivery tarball first (sz-workspace package / sz-replay package), then: bash \"\$SKILL_DIR/tools/sz-progress\" set SZ${ID} meta package <abs path>"
+    elif [[ ! -f "$pkg" ]]; then
+        bad "recorded package no longer exists: $pkg — rebuild and re-record"
+    else
+        tar_list="$(tar tzf "$pkg" | sed 's#^\./##; s#/$##' | grep -v '^$' | sort -u)"
+        if [[ "$tar_list" == "$planned" ]]; then
+            ok "delivery package listing == changed-paths.txt"
+        else
+            bad "delivery package listing != changed-paths.txt:"
+            diff <(printf '%s\n' "$tar_list") <(printf '%s\n' "$planned") | sed 's/^/        /'
+        fi
+        if tar tzf "$pkg" | grep -qE '(^|/)\.sz-dev(/|$)|/attachment/'; then
+            bad "run state leaked into the delivery package"
+        fi
+    fi
+fi
+
+if [[ "$fail" -ne 0 ]]; then
+    echo "sz-verify-tree: FAIL — fix the FAIL lines before setting gate 2/4 (never --force past them)."
+    exit 1
+fi
+suffix=""
+if [[ "$warn" -gt 0 ]]; then suffix=" (${warn} warning(s))"; fi
+echo "sz-verify-tree: PASS${suffix} — no commit, change set in scope."

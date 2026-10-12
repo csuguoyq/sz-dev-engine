@@ -1,0 +1,15 @@
+interface:
+  display_name: "Generate SZ TC"
+  short_description: "Generate a completed CciWiki TC from SoftZilla"
+  default_prompt: "Use $generate-sz-tc to read SZ35192 and generate a concise completed English CciWiki test record."
+
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "softzilla"
+      description: "Read SoftZilla task metadata, comments, and links"
+      transport: "streamable_http"
+      url: "http://10.2.2.39:8800/mcp"
+
+policy:
+  allow_implicit_invocation: true

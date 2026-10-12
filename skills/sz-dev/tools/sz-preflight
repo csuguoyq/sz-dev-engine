@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+# sz-preflight — invocation-start dependency check for the sz-dev skill.
+#
+# Automated part of SKILL.md "Preflight": bash/git, the skill's own
+# tools, and softzilla reachability. The softzilla AUTH check (a real
+# `bug_info` MCP call) can only be made by the agent — this script checks
+# network reachability only and says so. Exit 0 = all hard checks green;
+# exit 1 = at least one hard check failed (fix hints printed).
+#
+# Usage: bash sz-preflight [SZ number]   (SZ number optional; only used
+#        in the printed reminder for the agent's bug_info probe).
+#        Works via absolute path, relative path, or bare name on PATH
+#        (the tools carry the execute bit).
+
+set -u
+fail=0
+note() { printf '%s\n' "$*"; }
+ok()   { printf 'PASS  %s\n' "$*"; }
+bad()  { printf 'FAIL  %s\n' "$*"; fail=1; }
+
+# --- hard: interpreter commands -------------------------------------------
+for cmd in bash git; do
+  if command -v "$cmd" >/dev/null 2>&1; then
+    ok "$cmd: $(command -v "$cmd")"
+  else
+    bad "$cmd not in PATH — install it or fix PATH (human action)"
+  fi
+done
+
+# --- hard: the skill's own tools ------------------------------------------
+# Self-location must survive every documented invocation style: absolute
+# path, relative path, or bare name on PATH. `cd` inside a command
+# substitution echoes the CDPATH hit when the target is relative, which
+# once turned SKILL_DIR into two lines and failed every tool check on a
+# harmless CDPATH-bearing shell — hence CDPATH= on the cd itself.
+_self="${BASH_SOURCE[0]:-$0}"
+case "$_self" in
+  */*) ;;
+  *) _self="$(command -v -- "$_self" 2>/dev/null || printf '%s' "$_self")" ;;
+esac
+SKILL_DIR="${SZ_DEV_SKILL_DIR:-$(CDPATH= cd -- "$(dirname -- "$_self")/.." && pwd -P)}"
+for tool in sz-progress sz-workspace; do
+  f="$SKILL_DIR/tools/$tool"
+  if [ ! -f "$f" ]; then
+    bad "tools/$tool missing from skill dir $SKILL_DIR — restore the skill copy"
+    continue
+  fi
+  bash "$f" >/dev/null 2>&1
+  rc=$?
+  if [ "$rc" = "2" ]; then
+    ok "tools/$tool: usage prints (exit 2 = healthy)"
+  else
+    bad "tools/$tool: expected usage exit 2, got $rc — tool broken? run tools/selftest"
+  fi
+done
+
+# --- softzilla reachability (network-level only) ---------------------------
+# The agent MUST still make a real `bug_info` MCP call: reachability here
+# does not prove the MCP session/auth works.
+sz_url="${SZ_SOFTZILLA_URL:-https://cciconnect.clinicomp.com/SoftZilla}"
+code=$(curl -sS -o /dev/null -m 10 -w '%{http_code}' "$sz_url/index.cgi" 2>/dev/null)
+rc=$?
+if [ $rc -ne 0 ]; then
+  bad "softzilla unreachable at $sz_url (curl rc=$rc) — VPN/network down or server down; human action"
+elif [ "$code" = 000 ]; then
+  bad "softzilla unreachable at $sz_url (no HTTP status) — VPN/network or server down; human action"
+elif [ "$code" = 401 ] || [ "$code" = 403 ]; then
+  note "WARN  softzilla reachable but HTTP $code (session/auth expected at network level)"
+  note "      -> agent MUST still run the bug_info MCP probe; auth failure there = stop"
+else
+  ok "softzilla reachable at $sz_url (HTTP $code)"
+fi
+szmsg="(no SZ given)"
+[ -n "${1:-}" ] && szmsg="on SZ $1"
+note "REMIND  agent: run the softzilla MCP bug_info probe $szmsg next — auth failure = stop for the human; a 4xx at network level is expected without a session."
+
+# --- soft deps: note only, never block -------------------------------------
+command -v python3 >/dev/null 2>&1 || note "WARN  python3 not in PATH (needed only for CQL gates/runner/doc generation)"
+python3 -c 'import pymupdf' 2>/dev/null || python3 -c 'import pypdf' 2>/dev/null || \
+  note "WARN  no pymupdf/pypdf (needed only to read a PDF attachment with no .md beside it)"
+command -v node >/dev/null 2>&1 || \
+  note "WARN  node not in PATH (only the repo-level skills installer uses it — no run step needs it)"
+
+if [ "$fail" -ne 0 ]; then
+  note "sz-preflight: FAIL — stop the sz-dev run here and hand the FAIL lines to the human."
+  exit 1
+fi
+note "sz-preflight: PASS — hard dependencies green; continue with the bug_info probe."
